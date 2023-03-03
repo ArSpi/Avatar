@@ -240,7 +240,7 @@ def main():
         background_ray_values = background[select_inds[:, 0], select_inds[:, 1], :] if (trainable_background or fixed_background) else None
 
         # 计算渲染后的图像
-        rgb_coarse, _, _, rgb_fine, _, _, weights = run_one_iter_of_nerf(
+        rgb_coarse, rgb_fine, weights = run_one_iter_of_nerf(
             H,  # 图像高度
             W,  # 图像宽度
             focal,  # 相机焦距

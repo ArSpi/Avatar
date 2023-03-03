@@ -1,6 +1,68 @@
 import torch
 
-from nerf_helpers import ndc_rays, get_minibatches
+from nerf_helpers import ndc_rays, get_minibatches, cumprod_exclusive
+
+
+def volume_render_radiance_field(
+    radiance_field, # 一批射线上所有采样点的颜色和密度 (num_rays, num_coarse, 4)
+    depth_values, # 一批射线上所有采样点的深度z_vals (num_rays, num_coarse)
+    ray_directions, # 穿过各像素点的射线的方向向量 (num_rays, 3)
+    radiance_field_noise_std=0.0, # 体积渲染时需要添加到辐射场中的噪音的标准偏差
+    white_background=False, # 是否使用白色作为背景的底色
+    background_prior = None # 各像素点的背景颜色
+):
+    # 计算同一条射线上的各采样点的深度差，最后添加1e10代表积分到无穷远处 (num_rays, num_coarse)
+    one_e_10 = torch.tensor(
+        [1e10], dtype=ray_directions.dtype, device=ray_directions.device
+    )
+    dists = torch.cat(
+        (
+            depth_values[..., 1:] - depth_values[..., :-1],  # (num_rays, num_coarse-1)
+            one_e_10.expand(depth_values[..., :1].shape),  # (num_rays, 1)
+        ),
+        dim=-1,
+    )
+
+    # 计算同一条射线上的各采样点的深度差的实际欧式距离 (num_rays, num_coarse)
+    dists = dists * ray_directions[..., None, :].norm(p=2, dim=-1)
+
+    # 提取神经辐射场中的一批射线上各采样点的rgb值，其中最后的背景采样点不通过sigmoid
+    if background_prior:
+        rgb = torch.sigmoid(radiance_field[:, :-1, :3]) # rgb(num_rays, num_coarse-1, 3)
+        rgb = torch.cat((rgb, radiance_field[:, -1, :3].unsqueeze(1)), dim=1) # rgb(num_rays, num_coarse, 3)
+    else:
+        rgb = torch.sigmoid(radiance_field[..., :3])
+
+    # 对神经辐射场中的一批射线上各采样点的sigmoid值添加均值为0、方差为radiance_field_noise_std的高斯白噪声
+    noise = 0.0
+    if radiance_field_noise_std > 0.0:
+        noise = (
+            torch.randn(
+                radiance_field[..., 3].shape,
+                dtype=radiance_field.dtype,
+                device=radiance_field.device,
+            )  # 生成满足均值为0、方差为1的高斯白噪声
+            * radiance_field_noise_std
+        )
+    sigma_a = torch.nn.functional.relu(radiance_field[..., 3] + noise)
+
+    # 计算一系列同质媒介的alpha值 alpha_i = 1 - exp(-sigma_i * delta_i)
+    alpha = 1.0 - torch.exp(-sigma_a * dists)
+
+    # 计算一系列同质媒介的rgb权重值 weight_i = T_i * alpha_i
+    # where T_i = exp(-\sum_{j=1}^{i-1}{sigma_i * delta_i}) = \prod_{j=1}^{i-1}{1 - alpha_i}
+    weights = alpha * cumprod_exclusive(1.0 - alpha + 1e-10)
+
+    # 对各段同质媒介进行权重求和，得到图像中一批像素的rgb值（与一批射线对应）
+    rgb_map = weights[..., None] * rgb
+    rgb_map = rgb_map.sum(dim=-2)  # dim=-2是num_coarse采样点
+
+    # 添加背景的白色底色
+    acc_map = weights.sum(dim=-1) # 计算不透明度
+    if white_background:
+        rgb_map = rgb_map + (1.0 - acc_map[..., None])
+
+    return rgb_map, weights
 
 
 def run_network(
@@ -98,19 +160,17 @@ def predict_and_render_radiance(
         radiance_field[:, -1, :3] = background_prior
 
     # 将神经辐射场渲染出二维图像
-    rgb_coarse, disp_coarse, acc_coarse, weights, depth_coarse = volume_render_radiance_field(
+    rgb_coarse, weights = volume_render_radiance_field(
         radiance_field,  # 射线采样点的颜色和密度 (num_rays, num_coarse, 4)
         z_vals,  # 采样点深度（从near到far）
         rd,  # 穿过各像素点的射线的方向向量 (num_rays, 3)
         radiance_field_noise_std=getattr(cfg.nerf, mode).radiance_field_noise_std,  # 体积渲染时需要添加到辐射场中的噪音的标准偏差
-        white_background=getattr(cfg.nerf, mode).white_background,  # False 不使用白背景
+        white_background=getattr(cfg.nerf, mode).white_background,  # 是否使用白色作为背景的底色
         background_prior=background_prior  # 各像素点的背景颜色
     )
 
-    '''
-    细网络
-    '''
-    rgb_fine, disp_fine, acc_fine = None, None, None
+    # 根据粗分辨率网络的渲染结果训练细分辨率网络
+    rgb_fine = None
     if getattr(cfg.nerf, mode).num_fine:
         z_vals_mid = 0.5 * (z_vals[..., 1:] + z_vals[..., :-1])
         z_samples = sample_pdf(
@@ -122,7 +182,7 @@ def predict_and_render_radiance(
         z_samples = z_samples.detach()
 
         z_vals, _ = torch.sort(torch.cat((z_vals, z_samples), dim=-1), dim=-1)
-        # pts -> (N_rays, num_coarse + N_importance, 3)
+
         pts = ro[..., None, :] + rd[..., None, :] * z_vals[..., :, None]
 
         radiance_field = run_network(
@@ -139,7 +199,7 @@ def predict_and_render_radiance(
         if background_prior:
             radiance_field[:, -1, :3] = background_prior
 
-        rgb_fine, disp_fine, acc_fine, weights, depth_fine = volume_render_radiance_field(  # added use of weights
+        rgb_fine, weights = volume_render_radiance_field(  # added use of weights
             radiance_field,
             z_vals,
             rd,
@@ -151,7 +211,7 @@ def predict_and_render_radiance(
         )
 
     # changed last return val to fine_weights
-    return rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine, weights[:, -1]
+    return rgb_coarse, rgb_fine, weights[:, -1]
 
 
 def run_one_iter_of_nerf(
@@ -177,6 +237,13 @@ def run_one_iter_of_nerf(
     # Provide ray directions as input
     viewdirs = ray_directions
     viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)  # viewdirs(2048,3)
+
+    ###################################
+    # 这里这里！看这里的viewdirs,在nerf-pytorch的render函数中，viewdirs是要和rays进行拼接的
+    # 就是rays = torch.cat([rays, viewdirs], -1)
+    # 我说怎么要取rays的后3位作为方向呢，这就对了
+    # 后续要把上面那句代码补上
+    ###################################
 
     '''???
 
@@ -260,9 +327,9 @@ def run_one_iter_of_nerf(
         if model_fine:
             return tuple(synthesized_images)
         else:
-            # If the fine network is not used, rgb_fine, disp_fine, acc_fine are
+            # If the fine network is not used, rgb_fine are
             # set to None.
-            return tuple(synthesized_images + [None, None, None])
+            return tuple(synthesized_images + [None])
 
     # return rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine, weights[:, -1]
     return tuple(synthesized_images)
