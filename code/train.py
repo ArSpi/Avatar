@@ -1,18 +1,21 @@
 import argparse
 import os
+import time
 from datetime import datetime
 
 import torch
+import torchvision
 import yaml
 import numpy as np
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import trange
+from tqdm import trange, tqdm
 from yacs.config import CfgNode
 from PIL import Image
 
 from load_dataset import load_data
 import models
-from nerf_helpers import get_embedding_function
+from nerf_helpers import get_embedding_function, get_ray_bundle, meshgrid_xy, mse2psnr
+from train_utils import run_one_iter_of_nerf
 
 
 def create_nerf(cfg):
@@ -28,7 +31,7 @@ def create_nerf(cfg):
         num_encoding_functions=cfg.models.coarse.num_encoding_fn_dir,  # 方向编码的采样频率的数量
         include_input=cfg.models.coarse.include_input_dir,  # 方向编码中是否包括输入的向量
         log_sampling=cfg.models.coarse.log_sampling_dir,  # 方向编码的样本点是否以对数形式采样
-    ) if cfg.models.coarse.use_viewdirs else None
+    )
 
     # 初始化粗分辨率网络
     model_coarse = getattr(models, cfg.models.coarse.type)(
@@ -157,6 +160,21 @@ def main():
     else:
         latent_codes = None
 
+    # 生成射线重要性采样图
+    ray_importance_sampling_maps = []
+    p = 0.9
+    for i in i_train:
+        # 提取当前图像的边界框
+        bbox = bboxs[i]
+        # 边界框内的像素概率设置为p，边界框外的像素概率设置为1-p
+        probs = np.zeros((H, W))
+        probs.fill(1 - p)
+        probs[bbox[0]:bbox[1], bbox[2]:bbox[3]] = p
+        # 概率归一化
+        probs = (1 / probs.sum()) * probs
+        # 压扁后加入射线重要性采样图中
+        ray_importance_sampling_maps.append(probs.reshape(-1))
+
     # 设置优化器
     trainable_parameters = list(model_coarse.parameters())
     if model_fine:
@@ -191,13 +209,187 @@ def main():
     # 开始训练
     print("Starting loop.")
     for i in trange(start_iter, cfg.experiment.train_iters):
+        # 开启训练模式
+        model_coarse.train()
+        if model_fine:
+            model_fine.train()
 
+        # 从训练集中选出一张图像及其位姿、表情、潜在代码、重要性采样图信息
+        img_idx = np.random.choice(i_train)
+        img_target = images[img_idx].to(device)
+        pose_target = poses[img_idx, :3, :4].to(device)
+        expression_target = expressions[img_idx].to(device)
+        latent_code = latent_codes[img_idx].to(device) if use_latent_codes else None
+        ray_importance_sampling_map = ray_importance_sampling_maps[img_idx]
 
+        # 计算穿过图像所有像素[i][j]的光线束的原点(W,H,3)和方向(W,H,3)（世界坐标系下）
+        ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
 
+        # meshgrid + stack = 坐标
+        coords = torch.stack(meshgrid_xy(torch.arange(H).to(device), torch.arange(W).to(device)), dim=-1)
+        # 压扁为(HW, 2)
+        coords = coords.reshape((-1, 2))
+        # 根据重要性采样图随机选出图像中的像素点坐标，共选择cfg.nerf.train.num_random_rays个像素坐标
+        select_inds = np.random.choice(coords.shape[0], size=(cfg.nerf.train.num_random_rays), replace=False, p=ray_importance_sampling_map)
+        select_inds = coords[select_inds]
+        # 获取选出的像素坐标对应的原点o和方向d
+        ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]  # (cfg.nerf.train.num_random_rays, 3)
+        ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]  # (cfg.nerf.train.num_random_rays, 3)
+        # 获取GT图像及(GT背景/训练背景)中选出的像素坐标的颜色
+        target_ray_values = img_target[select_inds[:, 0], select_inds[:, 1], :]  # (512,512,3) ==> (cfg.nerf.train.num_random_rays, 3)
+        background_ray_values = background[select_inds[:, 0], select_inds[:, 1], :] if (trainable_background or fixed_background) else None
 
+        # 计算渲染后的图像
+        rgb_coarse, _, _, rgb_fine, _, _, weights = run_one_iter_of_nerf(
+            H,  # 图像高度
+            W,  # 图像宽度
+            focal,  # 相机焦距
+            model_coarse,  # 粗模型
+            model_fine,  # 细模型
+            ray_origins,  # 射线原点
+            ray_directions,  # 射线方向
+            cfg,  # 从配置文件中读取的配置
+            mode="train", # train或validation
+            encode_position_fn=encode_position_fn,  # 位置编码函数
+            encode_direction_fn=encode_direction_fn,  # 方向编码函数
+            expressions=expression_target,  # GT表情系数
+            background_prior=background_ray_values,  # GT背景像素颜色
+            latent_code=latent_code  # 潜在代码
+        )
 
+        # 计算损失函数
+        coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_ray_values[..., :3])
+        fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_ray_values[..., :3]) if rgb_fine else 0.0
+        latent_code_loss = torch.norm(latent_code) * 0.0005 if use_latent_codes else 0.0
+        background_loss = torch.mean(
+            torch.nn.functional.mse_loss(
+                background_ray_values[..., :3], target_ray_values[..., :3], reduction='none'
+            ).sum(1) * weights
+        ) * 0.001 if trainable_background else 0.0
+
+        loss = coarse_loss + fine_loss
+        psnr = mse2psnr(loss.item())
+        loss += background_loss
+        loss += latent_code_loss * 10
+
+        # 反向传播
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+
+        # 学习率衰减
+        num_decay_steps = cfg.scheduler.lr_decay * 1000
+        lr_new = cfg.optimizer.lr * (
+                cfg.scheduler.lr_decay_factor ** (i / num_decay_steps)
+        )
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_new
+
+        # 输出训练指标
+        if i % cfg.experiment.print_every == 0 or i == cfg.experiment.train_iters - 1:
+            tqdm.write(f"[TRAIN] Iter: {str(i)} Loss: {str(loss.item())} BG Loss: {str(background_loss.item())} PSNR: {str(psnr)} LatentReg: {str(latent_code_loss.item())}")
+
+        # 生成训练日志
+        writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
+        if rgb_fine:
+            writer.add_scalar("train/fine_loss", fine_loss.item(), i)
+        writer.add_scalar("train/psnr", psnr, i)
+        if trainable_background:
+            writer.add_scalar("train/bg_loss", background_loss.item(), i)
+        if use_latent_codes:
+            writer.add_scalar("train/code_loss", latent_code_loss.item(), i)
+
+        # 验证阶段
+        if i % cfg.experiment.validate_every == 0 or i == cfg.experiment.train_iters - 1:
+            tqdm.write("[VAL] =======> Iter: " + str(i))
+
+            model_coarse.eval()
+            if model_fine:
+                model_fine.eval()
+
+            start = time.time()
+            with torch.no_grad():
+                # rgb_coarse, rgb_fine = None, None
+                # target_ray_values = None
+                #
+                # loss = 0
+                # for img_idx in i_val[:2]:
+                #     img_target = images[img_idx].to(device)
+                #     pose_target = poses[img_idx, :3, :4].to(device)
+                #     ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
+                #     rgb_coarse, _, _, rgb_fine, _, _, weights = run_one_iter_of_nerf(
+                #         H,
+                #         W,
+                #         focal,
+                #         model_coarse,
+                #         model_fine,
+                #         ray_origins,
+                #         ray_directions,
+                #         cfg,
+                #         mode="validation",
+                #         encode_position_fn=encode_position_fn,
+                #         encode_direction_fn=encode_direction_fn,
+                #         expressions=expression_target,
+                #         background_prior=background.view(-1, 3) if (trainable_background or fixed_background) else None,
+                #         latent_code=torch.zeros(32).to(device) if use_latent_codes else None,
+                #
+                #     )
+                #     target_ray_values = img_target
+                #     coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
+                #     curr_loss, curr_fine_loss = 0.0, 0.0
+                #     if rgb_fine is not None:
+                #         curr_fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
+                #         curr_loss = curr_fine_loss
+                #     else:
+                #         curr_loss = coarse_loss
+                #     loss += curr_loss + curr_fine_loss
+
+                # 计算验证指标，生成验证日志
+                loss /= len(i_val)
+                psnr = mse2psnr(loss.item())
+                writer.add_scalar("validation/loss", loss.item(), i)
+                writer.add_scalar("validation/psnr", psnr, i)
+                writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
+                writer.add_image("validation/rgb_coarse", cast_to_image(rgb_coarse[..., :3]), i)
+                if rgb_fine:
+                    writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
+                    writer.add_image("validation/rgb_fine", cast_to_image(rgb_fine[..., :3]), i)
+                writer.add_image("validation/img_target",cast_to_image(target_ray_values[..., :3]),i)
+                if trainable_background or fixed_background:
+                    writer.add_image("validation/background", cast_to_image(background[..., :3]), i)
+                    writer.add_image("validation/weights", (weights.detach().cpu().numpy()), i, dataformats='HW')
+                tqdm.write(f"Validation loss: {str(loss.item())} Validation PSNR: {str(psnr)} Time: {str(time.time() - start)}")
+
+        # 保存检查点
+        if i % cfg.experiment.save_every == 0 or i == cfg.experiment.train_iters - 1:
+            checkpoint_dict = {
+                "iter": i,
+                "model_coarse_state_dict": model_coarse.state_dict(),
+                "model_fine_state_dict": model_fine.state_dict() if model_fine else None,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": loss - background_loss,
+                "psnr": psnr,
+                "background": background.data if (trainable_background or fixed_background) else None,
+                "latent_codes": latent_codes.data if use_latent_codes else None
+            }
+            torch.save(
+                checkpoint_dict,
+                os.path.join(logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
+            )
+            tqdm.write("================== Saved Checkpoint =================")
 
     print("Done!")
+
+
+def cast_to_image(tensor):
+    # Input tensor is (H, W, 3). Convert to (3, H, W).
+    tensor = tensor.permute(2, 0, 1)
+    tensor = tensor.clamp(0.0,1.0)
+    # Conver to PIL Image and then np.array (output shape: (H, W, 3))
+    img = np.array(torchvision.transforms.ToPILImage()(tensor.detach().cpu()))
+    # Map back to shape (3, H, W), as tensorboard needs channels first.
+    img = np.moveaxis(img, [-1], [0])
+    return img
 
 if __name__ == "__main__":
     main()
