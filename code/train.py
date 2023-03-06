@@ -14,7 +14,7 @@ from PIL import Image
 
 from load_dataset import load_data
 import models
-from nerf_helpers import get_embedding_function, get_ray_bundle, meshgrid_xy, mse2psnr
+from nerf_helpers import get_embedding_function, get_ray_bundle, meshgrid_xy, mse2psnr, img2mse
 from train_utils import run_one_iter_of_nerf
 
 
@@ -233,7 +233,7 @@ def main():
         target_ray_values = img_target[select_inds[:, 0], select_inds[:, 1], :]
         background_ray_values = background[select_inds[:, 0], select_inds[:, 1], :] if (trainable_background or fixed_background) else None
 
-        # 计算渲染后的图像
+        # 计算渲染后的像素颜色
         rgb_coarse, rgb_fine, weights = run_one_iter_of_nerf(
             H,  # 图像高度
             W,  # 图像宽度
@@ -305,42 +305,50 @@ def main():
             if model_fine:
                 model_fine.eval()
 
-            # start = time.time()
-            # with torch.no_grad():
-            #     rgb_coarse, rgb_fine = None, None
-            #     target_ray_values = None
-            #
-            #     loss = 0
-            #     for img_idx in i_val[:2]:
-            #         img_target = images[img_idx].to(device)
-            #         pose_target = poses[img_idx, :3, :4].to(device)
-            #         ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
-            #         rgb_coarse, _, _, rgb_fine, _, _, weights = run_one_iter_of_nerf(
-            #             H,
-            #             W,
-            #             focal,
-            #             model_coarse,
-            #             model_fine,
-            #             ray_origins,
-            #             ray_directions,
-            #             cfg,
-            #             mode="validation",
-            #             encode_position_fn=encode_position_fn,
-            #             encode_direction_fn=encode_direction_fn,
-            #             expressions=expression_target,
-            #             background_prior=background.view(-1, 3) if (trainable_background or fixed_background) else None,
-            #             latent_code=torch.zeros(32).to(device) if use_latent_codes else None,
-            #
-            #         )
-            #         target_ray_values = img_target
-            #         coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
-            #         curr_loss, curr_fine_loss = 0.0, 0.0
-            #         if rgb_fine is not None:
-            #             curr_fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
-            #             curr_loss = curr_fine_loss
-            #         else:
-            #             curr_loss = coarse_loss
-            #         loss += curr_loss + curr_fine_loss
+            start = time.time()
+            with torch.no_grad():
+                rgb_coarse, rgb_fine = None, None
+                target_ray_values = None
+
+                loss = 0
+                for img_idx in i_val:
+                    # 获取验证集图像及其位姿、表情、潜在代码信息
+                    img_target = images[img_idx].to(device)
+                    pose_target = poses[img_idx, :3, :4].to(device)
+                    expression_target = expressions[img_idx].to(device)
+                    latent_code = torch.zeros(32).to(device)
+
+                    # 计算穿过验证集图像所有像素的光线束的原点和方向（世界坐标系下）
+                    ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
+                    ray_origins = ray_origins.view((-1, 3))
+                    ray_directions = ray_directions.view((-1, 3))
+
+                    # 计算渲染后的完整图像
+                    rgb_coarse, rgb_fine, weights = run_one_iter_of_nerf(
+                        H,
+                        W,
+                        focal,
+                        model_coarse,
+                        model_fine,
+                        ray_origins,
+                        ray_directions,
+                        cfg,
+                        mode="validation",
+                        encode_position_fn=encode_position_fn,
+                        encode_direction_fn=encode_direction_fn,
+                        expressions=expression_target,
+                        background_prior=background.view(-1, 3) if (trainable_background or fixed_background) else None,
+                        latent_code=torch.zeros(32).to(device) if use_latent_codes else None,
+                        validation_image_shape=img_target.shape
+                    )
+
+                    # 计算损失函数
+                    target_ray_values = img_target
+                    coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
+                    loss = loss + coarse_loss
+                    if rgb_fine is not None:
+                        fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
+                        loss = loss + fine_loss
 
                 # 计算验证指标，生成验证日志
                 loss /= len(i_val)
@@ -349,10 +357,10 @@ def main():
                 writer.add_scalar("validation/psnr", psnr, i)
                 writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
                 writer.add_image("validation/rgb_coarse", cast_to_image(rgb_coarse[..., :3]), i)
-                if rgb_fine:
+                if rgb_fine is not None:
                     writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
                     writer.add_image("validation/rgb_fine", cast_to_image(rgb_fine[..., :3]), i)
-                writer.add_image("validation/img_target",cast_to_image(target_ray_values[..., :3]),i)
+                writer.add_image("validation/img_target", cast_to_image(target_ray_values[..., :3]),i)
                 if trainable_background or fixed_background:
                     writer.add_image("validation/background", cast_to_image(background[..., :3]), i)
                     writer.add_image("validation/weights", (weights.detach().cpu().numpy()), i, dataformats='HW')
@@ -388,6 +396,7 @@ def cast_to_image(tensor):
     # Map back to shape (3, H, W), as tensorboard needs channels first.
     img = np.moveaxis(img, [-1], [0])
     return img
+
 
 if __name__ == "__main__":
     main()

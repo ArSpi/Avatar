@@ -217,69 +217,47 @@ def predict_and_render_radiance(
     # 注意返回的权重值是细分辨率网络训练出的权重值
     return rgb_coarse, rgb_fine, weights[:, -1]
 
-# 需要再大致整理一下
+
 def run_one_iter_of_nerf(
-        height, # 图像的像素高度
-        width, # 图像的像素宽度
-        focal_length, # 相机的焦距
-        model_coarse, # 粗分辨率模型
-        model_fine, # 细分辨率模型
+        height,  # 图像的像素高度
+        width,  # 图像的像素宽度
+        focal_length,  # 相机的焦距
+        model_coarse,  # 粗分辨率模型
+        model_fine,  # 细分辨率模型
         ray_origins,  # 图像中选出的像素对应的射线原点 (cfg.nerf.train.num_random_rays, 3)
         ray_directions,  # 图像中选出的像素对应的射线方向 (cfg.nerf.train.num_random_rays, 3)
-        cfg, # 配置文件
-        mode, # train或validation
-        encode_position_fn, # 位置编码函数
-        encode_direction_fn, # 方向编码函数
-        expressions, # GT表情系数
-        background_prior, # GT背景/训练背景 (cfg.nerf.train.num_random_rays, 3)
-        latent_code # 潜在代码
+        cfg,  # 配置文件
+        mode,  # train或validation
+        encode_position_fn,  # 位置编码函数
+        encode_direction_fn,  # 方向编码函数
+        expressions,  # GT表情系数
+        background_prior,  # GT背景/训练背景 (cfg.nerf.train.num_random_rays, 3)
+        latent_code,  # 潜在代码
+        validation_image_shape=None  # 验证过程应返回图像的形状（训练过程只需要返回像素集）
 ):
-    # ###################################
-    # # 这里这里！看这里的viewdirs,在nerf-pytorch的render函数中，viewdirs是要和rays进行拼接的
-    # # 就是rays = torch.cat([rays, viewdirs], -1)
-    # # 我说怎么要取rays的后3位作为方向呢，这就对了
-    # # 后续要把上面那句代码补上
-    # ###################################
-    #
-    # '''???
-    #
-    # '''
-    # # Cache shapes now, for later restoration.
-    # restore_shapes = [
-    #     ray_directions.shape,
-    #     ray_directions.shape[:-1],
-    #     ray_directions.shape[:-1],
-    # ]
-    # if model_fine:
-    #     restore_shapes += restore_shapes
-    #     restore_shapes += [ray_directions.shape[:-1]]  # to return fine depth map
-
     # 产生rays，0-2维是ro，3-5维是rd，6维是near，7维是far (cfg.nerf.train.num_random_rays, 8)
-    if cfg.dataset.no_ndc:  # NDC空间用于无界场景，对于blender等有界场景不使用NDC空间
-        ro = ray_origins.view((-1, 3))
-        rd = ray_directions.view((-1, 3))
-    else:
-        ro, rd = ndc_rays(height, width, focal_length, 1.0, ray_origins, ray_directions)
-        ro = ro.view((-1, 3))
-        rd = rd.view((-1, 3))
+    ro, rd = ray_origins, ray_directions if cfg.dataset.no_ndc else ndc_rays(
+        height, width, focal_length, 1.0, ray_origins, ray_directions
+    ) # NDC空间用于无界场景，对于blender等有界场景不使用NDC空间
     near = cfg.dataset.near * torch.ones_like(rd[..., :1])
     far = cfg.dataset.far * torch.ones_like(rd[..., :1])
     rays = torch.cat((ro, rd, near, far), dim=-1)  # (cfg.nerf.train.num_random_rays, 8)
 
     # 将ray_directions归一化，得到单位方向向量viewdirs，并加入rays中
     viewdirs = ray_directions
-    viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)  # viewdirs(2048,3)
+    viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)  # (cfg.nerf.train.num_random_rays, 3)
     rays = torch.cat((rays, viewdirs), dim=-1) # (cfg.nerf.train.num_random_rays, 11)
 
     # 将rays拆分成小批量的射线束
+    chunksize = getattr(cfg.nerf, mode).chunksize
     batches = get_minibatches(
         rays,  # 各射线的(ro,rd,near,far)
-        chunksize=getattr(cfg.nerf, mode).chunksize  # chunksize: 2048
+        chunksize=chunksize  # chunksize: 2048
     )
     # 将background_prior拆分成小批量的像素集（一个像素正对应一条射线）
     background_prior = get_minibatches(
         background_prior,  # GT背景像素颜色
-        chunksize=getattr(cfg.nerf, mode).chunksize  # chunksize: 2048
+        chunksize=chunksize  # chunksize: 2048
     ) if background_prior is not None else background_prior  # GT背景像素颜色
 
     # 获取预测的图像各像素的颜色和权重参数
@@ -307,20 +285,14 @@ def run_one_iter_of_nerf(
         for image in synthesized_images
     ]
 
-    # if mode == "validation":
-    #     synthesized_images = [
-    #         image.view(shape) if image is not None else None
-    #         for (image, shape) in zip(synthesized_images, restore_shapes)
-    #     ]
-    #
-    #     # Returns rgb_coarse, disp_coarse, acc_coarse, rgb_fine, disp_fine, acc_fine
-    #     # (assuming both the coarse and fine networks are used).
-    #     if model_fine:
-    #         return tuple(synthesized_images)
-    #     else:
-    #         # If the fine network is not used, rgb_fine are
-    #         # set to None.
-    #         return tuple(synthesized_images + [None])
+    # 如果是验证过程，不应返回像素集，而是返回整张图像
+    if mode == "validation":
+        shapes = [validation_image_shape, validation_image_shape, (chunksize,)]
+        synthesized_images = [
+            image.view(shape) if image is not None else None
+            for (image, shape) in zip(synthesized_images, shapes)
+        ]
+        return tuple(synthesized_images)
 
     # return rgb_coarse, rgb_fine, weights[:, -1] 这里的weight是细分辨率网络训练出的权重值
     return tuple(synthesized_images)

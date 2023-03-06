@@ -188,3 +188,6 @@ def sample_pdf(
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
     return samples
+
+def img2mse(img_src, img_tgt):
+    return torch.nn.functional.mse_loss(img_src, img_tgt)
