@@ -5,6 +5,8 @@ import imageio
 import numpy as np
 import torch
 import cv2
+from tqdm import tqdm
+
 
 def translate_by_t_along_z(t):
     tform = np.eye(4).astype(np.float32)
@@ -58,7 +60,7 @@ def load_data(
         imgs, poses, expressions, bboxs = [], [], [], []
         skip = 1 if s == "train" else (testskip if testskip != 0 else 1)
 
-        for frame in meta['frame'][::skip]:
+        for frame in tqdm(meta['frames'][::skip]):
             # 图像
             fname = os.path.join(basedir, frame['file_path'] + '.png')
             imgs.append(imageio.imread(fname))
@@ -68,9 +70,7 @@ def load_data(
             expressions.append(np.array(frame['expression']))
             # 边界框
             if load_bbox:
-                bboxs.append(
-                    np.array(frame['bbox']) if 'bbox' in frame.keys() else np.array([0.0,1.0,0.0,1.0])
-                )
+                bboxs.append(np.array(frame['bbox']) if 'bbox' in frame.keys() else np.array([0.0, 1.0, 0.0, 1.0]))
 
         # 对图像进行归一化，转换图像、姿态、表情、边界框的类型
         imgs = (np.array(imgs) / 255.0).astype(np.float32)

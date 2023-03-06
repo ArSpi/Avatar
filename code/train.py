@@ -70,10 +70,10 @@ def create_nerf(cfg):
 def create_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", type=str, required=True, help="path to (.yml) config file."
+        "--config", type=str, help="path to (.yml) config file.", default="../dataset/person_1/person_1_config.yml"
     )
     parser.add_argument(
-        "--checkpoint", type=str, help="path to load saved checkpoint."
+        "--checkpoint", type=str, help="path to load saved checkpoint.", default=""
     )
     return parser
 
@@ -88,7 +88,7 @@ def main():
 
     # 读取配置文件
     cfg = None
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r', encoding='utf-8') as f:
         cfg_dict = yaml.load(f, Loader=yaml.FullLoader)
         cfg = CfgNode(cfg_dict)
 
@@ -121,14 +121,8 @@ def main():
         model_fine.to(device)
 
     # # ??? ablation
-    # train_background = False
-    # supervised_train_background = False
     # blur_background = False
     #
-    # train_latent_codes = True
-    # disable_expressions = False  # True to disable expressions
-    # disable_latent_codes = False  # True to disable latent codes
-    # fixed_background = True  # Do False to disable BG
     # regularize_latent_codes = True  # True to add latent code LOSS, false for most experiments
 
     # 设置背景
@@ -145,7 +139,7 @@ def main():
         background.requires_grad = True
     elif fixed_background: # 固定的真实背景
         print("Loading GT background.")
-        background = Image.open(os.path.join(cfg.dataset.basedir, 'bg', '00000.png'))
+        background = Image.open(os.path.join(cfg.dataset.basedir, 'bg', '00001.png'))
         background.thumbnail((H, W))
         background = torch.from_numpy(np.array(background).astype(np.float32)).to(device)
         background = background / 255
@@ -186,7 +180,7 @@ def main():
     optimizer = getattr(torch.optim, cfg.optimizer.type)(trainable_parameters, lr=cfg.optimizer.lr)
 
     # 生成训练日志
-    logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id, datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    logdir = os.path.join(cfg.experiment.logdir, cfg.experiment.id, datetime.now().strftime('%Y-%m-%d %H_%M_%S'))
     os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(logdir)
     with open(os.path.join(logdir, "config.yml"), "w") as f:
@@ -194,8 +188,8 @@ def main():
 
     # 加载已有检查点
     start_iter = 0
-    if os.path.exists(args.load_checkpoint):
-        checkpoint = torch.load(args.load_checkpoint)
+    if os.path.exists(args.checkpoint):
+        checkpoint = torch.load(args.checkpoint)
         model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
         if checkpoint["model_fine_state_dict"]:
             model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
@@ -235,8 +229,8 @@ def main():
         # 获取选出的像素坐标对应的原点o和方向d
         ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]  # (cfg.nerf.train.num_random_rays, 3)
         ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]  # (cfg.nerf.train.num_random_rays, 3)
-        # 获取GT图像及(GT背景/训练背景)中选出的像素坐标的颜色
-        target_ray_values = img_target[select_inds[:, 0], select_inds[:, 1], :]  # (512,512,3) ==> (cfg.nerf.train.num_random_rays, 3)
+        # 获取GT图像及(GT背景/训练背景)中选出的像素坐标的颜色 (512,512,3) ==> (cfg.nerf.train.num_random_rays, 3)
+        target_ray_values = img_target[select_inds[:, 0], select_inds[:, 1], :]
         background_ray_values = background[select_inds[:, 0], select_inds[:, 1], :] if (trainable_background or fixed_background) else None
 
         # 计算渲染后的图像
@@ -259,18 +253,22 @@ def main():
 
         # 计算损失函数
         coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_ray_values[..., :3])
-        fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_ray_values[..., :3]) if rgb_fine else 0.0
-        latent_code_loss = torch.norm(latent_code) * 0.0005 if use_latent_codes else 0.0
+        fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_ray_values[..., :3]) if rgb_fine is not None else 0.0
+        latent_code_loss = torch.norm(latent_code) * 0.0005
         background_loss = torch.mean(
             torch.nn.functional.mse_loss(
                 background_ray_values[..., :3], target_ray_values[..., :3], reduction='none'
             ).sum(1) * weights
-        ) * 0.001 if trainable_background else 0.0
+        ) * 0.001
 
-        loss = coarse_loss + fine_loss
+        loss = coarse_loss
+        if rgb_fine is not None:
+            loss = loss + fine_loss
         psnr = mse2psnr(loss.item())
-        loss += background_loss
-        loss += latent_code_loss * 10
+        if trainable_background:
+            loss = loss + background_loss
+        if use_latent_codes:
+            loss = loss + latent_code_loss * 10
 
         # 反向传播
         loss.backward()
@@ -291,7 +289,7 @@ def main():
 
         # 生成训练日志
         writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
-        if rgb_fine:
+        if rgb_fine is not None:
             writer.add_scalar("train/fine_loss", fine_loss.item(), i)
         writer.add_scalar("train/psnr", psnr, i)
         if trainable_background:
@@ -307,42 +305,42 @@ def main():
             if model_fine:
                 model_fine.eval()
 
-            start = time.time()
-            with torch.no_grad():
-                # rgb_coarse, rgb_fine = None, None
-                # target_ray_values = None
-                #
-                # loss = 0
-                # for img_idx in i_val[:2]:
-                #     img_target = images[img_idx].to(device)
-                #     pose_target = poses[img_idx, :3, :4].to(device)
-                #     ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
-                #     rgb_coarse, _, _, rgb_fine, _, _, weights = run_one_iter_of_nerf(
-                #         H,
-                #         W,
-                #         focal,
-                #         model_coarse,
-                #         model_fine,
-                #         ray_origins,
-                #         ray_directions,
-                #         cfg,
-                #         mode="validation",
-                #         encode_position_fn=encode_position_fn,
-                #         encode_direction_fn=encode_direction_fn,
-                #         expressions=expression_target,
-                #         background_prior=background.view(-1, 3) if (trainable_background or fixed_background) else None,
-                #         latent_code=torch.zeros(32).to(device) if use_latent_codes else None,
-                #
-                #     )
-                #     target_ray_values = img_target
-                #     coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
-                #     curr_loss, curr_fine_loss = 0.0, 0.0
-                #     if rgb_fine is not None:
-                #         curr_fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
-                #         curr_loss = curr_fine_loss
-                #     else:
-                #         curr_loss = coarse_loss
-                #     loss += curr_loss + curr_fine_loss
+            # start = time.time()
+            # with torch.no_grad():
+            #     rgb_coarse, rgb_fine = None, None
+            #     target_ray_values = None
+            #
+            #     loss = 0
+            #     for img_idx in i_val[:2]:
+            #         img_target = images[img_idx].to(device)
+            #         pose_target = poses[img_idx, :3, :4].to(device)
+            #         ray_origins, ray_directions = get_ray_bundle(H, W, focal, pose_target)
+            #         rgb_coarse, _, _, rgb_fine, _, _, weights = run_one_iter_of_nerf(
+            #             H,
+            #             W,
+            #             focal,
+            #             model_coarse,
+            #             model_fine,
+            #             ray_origins,
+            #             ray_directions,
+            #             cfg,
+            #             mode="validation",
+            #             encode_position_fn=encode_position_fn,
+            #             encode_direction_fn=encode_direction_fn,
+            #             expressions=expression_target,
+            #             background_prior=background.view(-1, 3) if (trainable_background or fixed_background) else None,
+            #             latent_code=torch.zeros(32).to(device) if use_latent_codes else None,
+            #
+            #         )
+            #         target_ray_values = img_target
+            #         coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
+            #         curr_loss, curr_fine_loss = 0.0, 0.0
+            #         if rgb_fine is not None:
+            #             curr_fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
+            #             curr_loss = curr_fine_loss
+            #         else:
+            #             curr_loss = coarse_loss
+            #         loss += curr_loss + curr_fine_loss
 
                 # 计算验证指标，生成验证日志
                 loss /= len(i_val)

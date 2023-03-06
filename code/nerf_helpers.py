@@ -45,12 +45,9 @@ def positional_encoding(
 def get_ray_bundle(
         height,  # 图像的像素高度
         width,  # 图像的像素宽度
-        focal,  # 相机的焦距
+        intrinsics,  # 相机的内参
         tform_cam2world  # 相机的位姿，同时也是相机坐标系向世界坐标系变换的变换矩阵
 ):
-    # 获取相机内参
-    intrinsics = [focal, focal, 0.5, 0.5]
-
     # meshgrid + stack = 坐标
     # direction = [(i-0.5W)/f, -(j-0.5H)/f, -1]
     ii, jj = meshgrid_xy(
@@ -123,7 +120,7 @@ def mse2psnr(mse):
 
 # [a, b, c, d] ==> [1, a, a*b, a*b*c]
 def cumprod_exclusive(tensor):
-    dim = -1 # 仅处理最后一维
+    dim = -1  # 仅处理最后一维
 
     # 累乘
     cumprod = torch.cumprod(tensor, dim)
@@ -133,47 +130,61 @@ def cumprod_exclusive(tensor):
     return cumprod
 
 
-def sample_pdf_2(bins, weights, num_samples, det=False):
-    r"""sample_pdf function from another concurrent pytorch implementation
-    by yenchenlin (https://github.com/yenchenlin/nerf-pytorch).
-    """
-
+def sample_pdf(
+        bins,  # 同质媒介的中点深度 (num_rays, num_coarse-1)
+        weights,  # 同质媒介的rgb权重 (num_rays, num_coarse-1)
+        num_samples,  # 采样点数目
+        det  # 是否对采样点扰动
+):
+    # # 将权重归一化，得到概率密度函数 probability density function(PDF) (num_rays, num_coarse-1)
     weights = weights + 1e-5
     pdf = weights / torch.sum(weights, dim=-1, keepdim=True)
-    cdf = torch.cumsum(pdf, dim=-1)
-    cdf = torch.cat(
-        [torch.zeros_like(cdf[..., :1]), cdf], dim=-1
-    )  # (batchsize, len(bins))
 
-    # Take uniform samples
-    if det:
-        u = torch.linspace(
-            0.0, 1.0, steps=num_samples, dtype=weights.dtype, device=weights.device
-        )
+    # # 构建累积分布函数 cumulative distribution function(CDF) (num_rays, num_coarse-1)
+    cdf = torch.cumsum(pdf, dim=-1)  # 累加
+    cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], dim=-1)  # 前补0
+
+    # # 计算0到1之间的采样点 (num_rays, num_samples)
+    if det:  # 在0到1之间均匀采样
+        u = torch.linspace(0.0, 1.0, steps=num_samples, dtype=weights.dtype, device=weights.device)
         u = u.expand(list(cdf.shape[:-1]) + [num_samples])
-    else:
-        u = torch.rand(
-            list(cdf.shape[:-1]) + [num_samples],
-            dtype=weights.dtype,
-            device=weights.device,
-        )
+    else:  # 在0到1之间随机采样
+        u = torch.rand(list(cdf.shape[:-1]) + [num_samples], dtype=weights.dtype, device=weights.device)
 
-    # Invert CDF
     u = u.contiguous()
     cdf = cdf.contiguous()
-    #inds = torchsearchsorted.searchsorted(cdf, u, side="right")
-    inds = torch.searchsorted(cdf.detach(), u, right=True)
-    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
-    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
-    inds_g = torch.stack((below, above), dim=-1)  # (batchsize, num_samples, 2)
 
+    # # 在cdf曲线的纵轴上进行细采样 (num_rays, num_samples)
+    # 具体来说，对于u[i]，返回ind[i]，满足cdf[ind[i]-1] <= u[i] < cdf[ind[i]]
+    # 就是对u[i]“上取整”到cdf[ind[i]]，如果正好有u[i]=cdf[idx]，则ind[i]=idx+1
+    # 权重更大处，cdf曲线更陡，采样点更容易集中
+    inds = torch.searchsorted(cdf.detach(), u, right=True)
+
+    # # 获取细采样点对应的cdf曲线上的两个线性插值点
+    # 获取细采样点u在cdf上的“下取整”（用来作为cdf的索引），如果正好有u[i]=cdf[idx]，则ind[i]=idx below = max{0, inds - 1}
+    below = torch.max(torch.zeros_like(inds - 1), inds - 1)
+    # 获取细采样点u在cdf上的“上取整”（用来作为cdf的索引），如果正好有u[i]=cdf[idx]，则ind[i]=idx above = min{len(cdf)-1, inds}
+    above = torch.min((cdf.shape[-1] - 1) * torch.ones_like(inds), inds)
+    # 合并两者 inds_g = [below, above] (num_rays, num_samples, 2)
+    inds_g = torch.stack((below, above), dim=-1)
+
+    # # 获取两个线性插值点对应的cdf值和深度值
+    # 准备cdf曲线和深度值bins的匹配形状(num_rays, num_samples, num_coarse-1)
     matched_shape = (inds_g.shape[0], inds_g.shape[1], cdf.shape[-1])
+    # 获取细采样点的below和above索引对应的cdf值 cdf_g[i][j][k] = cdf[i][j][inds_g[i][j][k]] (num_rays, num_samples, 2)
     cdf_g = torch.gather(cdf.unsqueeze(1).expand(matched_shape), 2, inds_g)
+    # 获取细采样点的below和above索引对应的深度值 bins_g[i][j][k] = bins[i][j][inds_g[i][j][k]] (num_rays, num_samples, 2)
     bins_g = torch.gather(bins.unsqueeze(1).expand(matched_shape), 2, inds_g)
 
+    # # 使用两个线性插值点的cdf值获取线性插值系数
+    # 获取细采样点u对应的同质媒介的pdf值
     denom = cdf_g[..., 1] - cdf_g[..., 0]
+    # 如果denom小于1e-5，将其更改为1（针对uniform采样时采到1的情况）
     denom = torch.where(denom < 1e-5, torch.ones_like(denom), denom)
+    # 获取线性插值系数，实际上有t = (u - cdf[below]) / (cdf[above] - cdf[below])
     t = (u - cdf_g[..., 0]) / denom
+
+    # 对两个线性插值点的深度值进行线性插值，得到最终的深度采样点 (num_rays, num_samples)
     samples = bins_g[..., 0] + t * (bins_g[..., 1] - bins_g[..., 0])
 
     return samples
