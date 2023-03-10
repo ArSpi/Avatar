@@ -287,7 +287,8 @@ def run_one_iter_of_nerf(
 
     # 如果是验证过程，不应返回像素集，而是返回整张图像
     if mode == "validation":
-        shapes = [validation_image_shape, validation_image_shape, (chunksize,)]
+        num_pixels = validation_image_shape[0] * validation_image_shape[1]
+        shapes = [validation_image_shape, validation_image_shape, (num_pixels,)]
         synthesized_images = [
             image.view(shape) if image is not None else None
             for (image, shape) in zip(synthesized_images, shapes)

@@ -11,7 +11,7 @@ import models
 def create_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", type=str, help="path to (.yml) config file.", default="../dataset/person_1/person_1_config.yml"
+        "--config", type=str, help="path to (.yml) config file.", default="../dataset/person_2/person_2_config.yml"
     )
     parser.add_argument(
         "--checkpoint", type=str, help="path to load saved checkpoint.", default=""

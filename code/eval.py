@@ -11,7 +11,7 @@ from yacs.config import CfgNode
 from PIL import Image
 
 from train_utils import run_one_iter_of_nerf
-from nerf_helpers import create_parser, create_nerf, get_ray_bundle, cast_to_image, cast_to_disparity_image
+from nerf_helpers import create_parser, create_nerf, get_ray_bundle, cast_to_image
 from load_dataset import load_data
 
 

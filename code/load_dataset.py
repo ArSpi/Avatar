@@ -52,49 +52,46 @@ def load_data(
         with open(os.path.join(basedir, f'transforms_{s}.json'), 'r') as f:
             metas[s] = json.load(f)
 
+    # 获取数据集的所有帧的数量
+    num_frames = sum([len(meta['frames']) for meta in [metas[s] for s in splits]])
+    # 从frame中获取图像、姿态、表情、边界框的形状
+    sample_frame = metas['test']['frames'][0]
+    img_shape = imageio.imread(os.path.join(basedir, sample_frame['file_path'] + '.png')).shape
+    pose_shape = np.array(sample_frame['transform_matrix']).shape
+    expression_shape = np.array(sample_frame['expression']).shape
+    bbox_shape = np.array(sample_frame['bbox']).shape if 'bbox' in sample_frame.keys() else (4,)
+    # 图像、姿态、表情、边界框初始化，初始化类型为np.float32类型
+    imgs = np.zeros(tuple([num_frames] + list(img_shape)), dtype=np.float32)
+    poses = np.zeros(tuple([num_frames] + list(pose_shape)), dtype=np.float32)
+    expressions = np.zeros(tuple([num_frames] + list(expression_shape)), dtype=np.float32)
+    bboxs = np.zeros(tuple([num_frames] + list(bbox_shape)), dtype=np.float32)
     # 将meta信息拆分为图像、姿态、表情、边界框
-    all_imgs, all_poses, all_expressions, all_bboxs = [], [], [], []
+    idx = 0
     counts = [0]
     for s in splits:
+        print(f'{s} dataset is loading.')
         meta = metas[s]
-        imgs, poses, expressions, bboxs = [], [], [], []
         skip = 1 if s == "train" else (testskip if testskip != 0 else 1)
 
+        # 获取图像、姿态、表情、边界框
         for frame in tqdm(meta['frames'][::skip]):
             # 图像
             fname = os.path.join(basedir, frame['file_path'] + '.png')
-            imgs.append(imageio.imread(fname))
+            imgs[idx, ...] = imageio.imread(fname) / 255.0
             # 姿态
-            poses.append(np.array(frame['transform_matrix']))
+            poses[idx, ...] = np.array(frame['transform_matrix'])
             # 表情
-            expressions.append(np.array(frame['expression']))
+            expressions[idx, ...] = np.array(frame['expression'])
             # 边界框
             if load_bbox:
-                bboxs.append(np.array(frame['bbox']) if 'bbox' in frame.keys() else np.array([0.0, 1.0, 0.0, 1.0]))
-
-        # 对图像进行归一化，转换图像、姿态、表情、边界框的类型
-        imgs = (np.array(imgs) / 255.0).astype(np.float32)
-        poses = np.array(poses).astype(np.float32)
-        expressions = np.array(expressions).astype(np.float32)
-        bboxs = np.array(bboxs).astype(np.float32)
+                bboxs[idx, ...] = np.array(frame['bbox'] if 'bbox' in frame.keys() else np.array([0.0, 1.0, 0.0, 1.0]))
+            idx += 1
 
         # 对当前的训练集/验证集/测试集进行计数
-        counts.append(counts[-1] + imgs.shape[0])
-
-        # 准备将当前的训练集/验证集/测试集合并起来
-        all_imgs.append(imgs)
-        all_poses.append(poses)
-        all_expressions.append(expressions)
-        all_bboxs.append(bboxs)
+        counts.append(idx)
 
     # 生成训练集/验证集/测试集的样本索引
     i_split = [np.arange(counts[i], counts[i + 1]) for i in range(len(splits))]
-
-    # 合并当前的训练集/验证集/测试集数据
-    imgs = np.concatenate(all_imgs, 0)
-    poses = np.concatenate(all_poses, 0)
-    expressions = np.concatenate(all_expressions, 0)
-    bboxs = np.concatenate(all_bboxs, 0)
 
     # 计算相机的内参
     H, W = imgs[0].shape[:2]
