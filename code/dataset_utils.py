@@ -5,6 +5,7 @@ import imageio
 import numpy as np
 import torch
 import cv2
+from PIL import Image
 from tqdm import tqdm
 
 
@@ -39,11 +40,11 @@ def pose_spherical(theta, phi, radius):
 
 
 def load_data(
-        basedir, # 数据集的基准文件夹
-        half_res=False, # 是否以一半分辨率加载图像(half resolution)
-        testskip=1, # 测试集中每testskip张图像选取1张，避免测试集中相邻图像过于相似
-        load_bbox=True, # 是否加载边界框
-        test=False # 是否仅加载测试集
+        basedir,  # 数据集的基准文件夹
+        half_res=False,  # 是否以一半分辨率加载图像(half resolution)
+        testskip=1,  # 测试集中每testskip张图像选取1张，避免测试集中相邻图像过于相似
+        load_bbox=True,  # 是否加载边界框
+        test=False  # 是否仅加载测试集
 ):
     # 从transforms_{train/val/test}.json中提取train/val/test的meta信息
     splits = ["train", "val", "test"] if not test else ['test']
@@ -97,7 +98,8 @@ def load_data(
     H, W = imgs[0].shape[:2]
     camera_angle_x = float(metas['test']['camera_angle_x'])
     focal = 0.5 * W / np.tan(0.5 * camera_angle_x)
-    intrinsics = np.array(metas['test']["intrinsics"]) if metas['test']["intrinsics"] else np.array([focal, focal, 0.5, 0.5])
+    intrinsics = np.array(metas['test']["intrinsics"]) if metas['test']["intrinsics"] else np.array(
+        [focal, focal, 0.5, 0.5])
 
     # 直接生成渲染图像时应当使用的人脸姿态
     render_poses = torch.stack(
@@ -137,3 +139,79 @@ def load_data(
     # 返回最终值
     return imgs, poses, expressions, bboxs, i_split, [H, W, intrinsics], render_poses
 
+
+class NeRFDataset(object):
+    def __init__(self, cfg, device, images, poses, expressions, bboxs, i_split, hwf):
+        self.cfg = cfg
+        self.device = device
+        self.images = images
+        self.poses = poses
+        self.expressions = expressions
+        self.bboxs = bboxs
+        self.trainable_background, self.fixed_background, self.background = None, None, None
+        self.use_latent_codes, self.latent_codes, self.idx_map = None, None, None
+        self.p, self.ray_importance_sampling_maps = None, None
+
+        # 获取划分的训练集、验证集、测试集索引
+        self.i_train, self.i_val, self.i_test = i_split
+        # 获取相机内参
+        self.H, self.W, self.focal = int(hwf[0]), int(hwf[1]), hwf[2]
+        # 将图像从RGBA转为RGB，公式为targetRGB = sourceRGB * sourceA + BGcolor * (1 - sourceA)
+        if cfg.nerf.train.white_background:  # BGcolor = 1
+            self.images = self.images[..., :3] * self.images[..., -1:] + (1.0 - self.images[..., -1:])
+
+    # ---------- train ---------- #
+    def load_background(self, trainable_background, fixed_background):
+        self.trainable_background = trainable_background
+        self.fixed_background = fixed_background
+        if trainable_background:  # 可训练背景
+            print("Creating trainable background.")
+            # 背景初始化为训练集图像的平均值
+            with torch.no_grad():
+                avg_img = torch.mean(self.images[self.i_train], axis=0)
+                # ??? 模糊背景图
+                # ------------
+                background = torch.tensor(avg_img, device=self.device)
+            background.requires_grad = True
+        elif fixed_background:  # 固定的真实背景
+            print("Loading GT background.")
+            background = Image.open(os.path.join(self.cfg.dataset.basedir, 'bg', '00001.png'))
+            background.thumbnail((self.H, self.W))
+            background = torch.from_numpy(np.array(background).astype(np.float32)).to(self.device)
+            background = background / 255
+        else:
+            background = None
+        self.background = background
+
+    def load_latent_codes(self, use_latent_codes):
+        if use_latent_codes:
+            print("Setting latent codes.")
+            latent_codes = torch.zeros((len(self.i_train), 32), device=self.device)
+            latent_codes.requires_grad = True
+        else:
+            latent_codes = None
+        self.latent_codes = latent_codes
+
+    def generate_ray_importance_sampling_maps(self, p):
+        self.p = p
+        ray_importance_sampling_maps = []
+        for i in self.i_train:
+            # 提取当前图像的边界框
+            bbox = self.bboxs[i]
+            # 边界框内的像素概率设置为p，边界框外的像素概率设置为1-p
+            probs = np.zeros((self.H, self.W))
+            probs.fill(1 - p)
+            probs[bbox[0]:bbox[1], bbox[2]:bbox[3]] = p
+            # 概率归一化
+            probs = (1 / probs.sum()) * probs
+            # 压扁后加入射线重要性采样图中
+            ray_importance_sampling_maps.append(probs.reshape(-1))
+        self.ray_importance_sampling_maps = ray_importance_sampling_maps
+
+    # ---------- test ---------- #
+    def replace_background(self, img_path):
+        background = Image.open(img_path)
+        background.thumbnail((self.H, self.W))
+        background = torch.from_numpy(np.array(background).astype(float)).to(self.device)
+        background = background / 255
+        self.background = background

@@ -1,5 +1,7 @@
 import argparse
 import math
+import os
+import random
 
 import numpy as np
 import torch
@@ -271,3 +273,11 @@ def cast_to_image(tensor):
     # Map back to shape (3, H, W), as tensorboard needs channels first.
     img = np.moveaxis(img, [-1], [0])
     return img
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)

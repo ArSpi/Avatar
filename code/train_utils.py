@@ -1,15 +1,25 @@
-import torch
+import os
+import time
+from datetime import datetime
+from enum import Enum
 
-from nerf_helpers import ndc_rays, get_minibatches, cumprod_exclusive, sample_pdf
+import imageio
+import numpy as np
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import trange, tqdm
+
+from nerf_helpers import ndc_rays, get_minibatches, cumprod_exclusive, sample_pdf, get_ray_bundle, meshgrid_xy, \
+    mse2psnr, cast_to_image, img2mse
 
 
 def volume_render_radiance_field(
-    radiance_field, # 一批射线上所有采样点的颜色和密度 (num_rays, num_coarse, 4)
-    depth_values, # 一批射线上所有采样点的深度z_vals (num_rays, num_coarse)
-    ray_directions, # 穿过各像素点的射线的方向向量 (num_rays, 3)
-    radiance_field_noise_std=0.0, # 体积渲染时需要添加到辐射场中的噪音的标准偏差
-    white_background=False, # 是否使用白色作为背景的底色
-    background_prior = None # 各像素点的背景颜色
+        radiance_field,  # 一批射线上所有采样点的颜色和密度 (num_rays, num_coarse, 4)
+        depth_values,  # 一批射线上所有采样点的深度z_vals (num_rays, num_coarse)
+        ray_directions,  # 穿过各像素点的射线的方向向量 (num_rays, 3)
+        radiance_field_noise_std=0.0,  # 体积渲染时需要添加到辐射场中的噪音的标准偏差
+        white_background=False,  # 是否使用白色作为背景的底色
+        background_prior=None  # 各像素点的背景颜色
 ):
     # 计算同一条射线上的各采样点的深度差，最后添加1e10代表积分到无穷远处 (num_rays, num_coarse)
     one_e_10 = torch.tensor(
@@ -28,8 +38,8 @@ def volume_render_radiance_field(
 
     # 提取神经辐射场中的一批射线上各采样点的rgb值，其中最后的背景采样点不通过sigmoid
     if background_prior is not None:
-        rgb = torch.sigmoid(radiance_field[:, :-1, :3]) # rgb(num_rays, num_coarse-1, 3)
-        rgb = torch.cat((rgb, radiance_field[:, -1, :3].unsqueeze(1)), dim=1) # rgb(num_rays, num_coarse, 3)
+        rgb = torch.sigmoid(radiance_field[:, :-1, :3])  # rgb(num_rays, num_coarse-1, 3)
+        rgb = torch.cat((rgb, radiance_field[:, -1, :3].unsqueeze(1)), dim=1)  # rgb(num_rays, num_coarse, 3)
     else:
         rgb = torch.sigmoid(radiance_field[..., :3])
 
@@ -37,12 +47,12 @@ def volume_render_radiance_field(
     noise = 0.0
     if radiance_field_noise_std > 0.0:
         noise = (
-            torch.randn(
-                radiance_field[..., 3].shape,
-                dtype=radiance_field.dtype,
-                device=radiance_field.device,
-            )  # 生成满足均值为0、方差为1的高斯白噪声
-            * radiance_field_noise_std
+                torch.randn(
+                    radiance_field[..., 3].shape,
+                    dtype=radiance_field.dtype,
+                    device=radiance_field.device,
+                )  # 生成满足均值为0、方差为1的高斯白噪声
+                * radiance_field_noise_std
         )
     sigma_a = torch.nn.functional.relu(radiance_field[..., 3] + noise)
 
@@ -58,7 +68,7 @@ def volume_render_radiance_field(
     rgb_map = rgb_map.sum(dim=-2)  # dim=-2是num_coarse采样点
 
     # 添加背景的白色底色
-    acc_map = weights.sum(dim=-1) # 计算不透明度
+    acc_map = weights.sum(dim=-1)  # 计算不透明度
     if white_background:
         rgb_map = rgb_map + (1.0 - acc_map[..., None])
 
@@ -107,15 +117,15 @@ def run_network(
 
 def predict_and_render_radiance(
         ray_batch,  # 成批的射线束，包含ro,rd,near,far (num_rays, 8)
-        model_coarse, # 粗分辨率网络
-        model_fine, # 细分辨率网络
-        cfg, # 配置文件
-        mode, # train或validation
-        encode_position_fn, # 位置编码函数
-        encode_direction_fn, # 方向编码函数
-        expressions, # GT表情系数
-        background_prior, # GT背景/训练背景
-        latent_code # 潜在代码
+        model_coarse,  # 粗分辨率网络
+        model_fine,  # 细分辨率网络
+        cfg,  # 配置文件
+        mode,  # train或validation
+        encode_position_fn,  # 位置编码函数
+        encode_direction_fn,  # 方向编码函数
+        expressions,  # GT表情系数
+        background_prior,  # GT背景/训练背景
+        latent_code  # 潜在代码
 ):
     # 获取批量射线的条数
     num_rays = ray_batch.shape[0]  # chunksize: 2048
@@ -127,7 +137,8 @@ def predict_and_render_radiance(
     # 对于粗分辨率网络，从0到1进行均匀采样
     t_vals = torch.linspace(0.0, 1.0, getattr(cfg.nerf, mode).num_coarse, dtype=ro.dtype, device=ro.device)
     # 将从0到1的均匀采样线性映射到从near到far的均匀采样
-    z_vals = (near * (1.0 - t_vals) + far * t_vals) if not getattr(cfg.nerf, mode).lindisp else (1.0 / (1.0 / near * (1.0 - t_vals) + 1.0 / far * t_vals))
+    z_vals = (near * (1.0 - t_vals) + far * t_vals) if not getattr(cfg.nerf, mode).lindisp else (
+                1.0 / (1.0 / near * (1.0 - t_vals) + 1.0 / far * t_vals))
     # 将均匀采样的采样点扩展到所有射线上
     z_vals = z_vals.expand([num_rays, getattr(cfg.nerf, mode).num_coarse])
     # 对采样点进行扰动，所有射线上的采样点扰动相同
@@ -238,7 +249,7 @@ def run_one_iter_of_nerf(
     # 产生rays，0-2维是ro，3-5维是rd，6维是near，7维是far (cfg.nerf.train.num_random_rays, 8)
     ro, rd = ray_origins, ray_directions if cfg.dataset.no_ndc else ndc_rays(
         height, width, focal_length, 1.0, ray_origins, ray_directions
-    ) # NDC空间用于无界场景，对于blender等有界场景不使用NDC空间
+    )  # NDC空间用于无界场景，对于blender等有界场景不使用NDC空间
     near = cfg.dataset.near * torch.ones_like(rd[..., :1])
     far = cfg.dataset.far * torch.ones_like(rd[..., :1])
     rays = torch.cat((ro, rd, near, far), dim=-1)  # (cfg.nerf.train.num_random_rays, 8)
@@ -246,7 +257,7 @@ def run_one_iter_of_nerf(
     # 将ray_directions归一化，得到单位方向向量viewdirs，并加入rays中
     viewdirs = ray_directions
     viewdirs = viewdirs / viewdirs.norm(p=2, dim=-1).unsqueeze(-1)  # (cfg.nerf.train.num_random_rays, 3)
-    rays = torch.cat((rays, viewdirs), dim=-1) # (cfg.nerf.train.num_random_rays, 11)
+    rays = torch.cat((rays, viewdirs), dim=-1)  # (cfg.nerf.train.num_random_rays, 11)
 
     # 将rays拆分成小批量的射线束
     chunksize = getattr(cfg.nerf, mode).chunksize
@@ -297,3 +308,329 @@ def run_one_iter_of_nerf(
 
     # return rgb_coarse, rgb_fine, weights[:, -1] 这里的weight是细分辨率网络训练出的权重值
     return tuple(synthesized_images)
+
+
+class Mode(Enum):
+    TRAIN = 1
+    TEST = 2
+
+
+class Trainer(object):
+    def __init__(self,
+                 mode,
+                 args,
+                 cfg,
+                 device,
+                 model_coarse,
+                 model_fine,
+                 encode_position_fn,
+                 encode_direction_fn,
+                 optimizer,
+                 dataset
+    ):
+        self.mode = mode
+        self.args = args
+        self.cfg = cfg
+        self.device = device
+        self.model_coarse = model_coarse
+        self.model_fine = model_fine
+        self.encode_position_fn = encode_position_fn
+        self.encode_direction_fn = encode_direction_fn
+        self.optimizer = optimizer
+        self.dataset = dataset
+
+        self.start_iter = 0
+
+        model_coarse.to(self.device)
+        if hasattr(cfg.models, "fine"):
+            model_fine.to(self.device)
+        self.logdir, self.writer = self.create_logdir()
+        if os.path.exists(self.args.checkpoint):
+            self.load_checkpoint()
+
+    # ---------- train ---------- #
+    def train(self):
+        print("Starting loop.")
+        for i in trange(self.start_iter, self.cfg.experiment.train_iters):
+            # 开启训练模式
+            self.model_coarse.train()
+            if self.model_fine:
+                self.model_fine.train()
+            # 训练阶段
+            self.train_one_step(i)
+            # 验证阶段
+            if i % self.cfg.experiment.validate_every == 0 or i == self.cfg.experiment.train_iters - 1:
+                self.validate(i)
+        print("Done!")
+
+    def train_one_step(self, i):
+        # 从训练集中选出一张图像及其位姿、表情、潜在代码、重要性采样图信息
+        img_idx = np.random.choice(self.dataset.i_train)
+        img_target = self.dataset.images[img_idx].to(self.device)
+        pose_target = self.dataset.poses[img_idx, :3, :4].to(self.device)
+        expression_target = self.dataset.expressions[img_idx].to(self.device)
+        latent_code = self.dataset.latent_codes[img_idx].to(self.device) if self.dataset.use_latent_codes else None
+        ray_importance_sampling_map = self.dataset.ray_importance_sampling_maps[img_idx]
+
+        # 计算穿过图像所有像素[i][j]的光线束的原点(W,H,3)和方向(W,H,3)（世界坐标系下）
+        ray_origins, ray_directions = get_ray_bundle(self.dataset.H, self.dataset.W, self.dataset.focal, pose_target)
+
+        # meshgrid + stack = 坐标
+        coords = torch.stack(meshgrid_xy(
+            torch.arange(self.dataset.H).to(self.device),
+            torch.arange(self.dataset.W).to(self.device)
+        ), dim=-1)
+        # 压扁为(HW, 2)
+        coords = coords.reshape((-1, 2))
+        # 根据重要性采样图随机选出图像中的像素点坐标，共选择cfg.nerf.train.num_random_rays个像素坐标
+        select_inds = np.random.choice(coords.shape[0], size=self.cfg.nerf.train.num_random_rays, replace=False, p=ray_importance_sampling_map)
+        select_inds = coords[select_inds]
+        # 获取选出的像素坐标对应的原点o和方向d
+        ray_origins = ray_origins[select_inds[:, 0], select_inds[:, 1], :]  # (cfg.nerf.train.num_random_rays, 3)
+        ray_directions = ray_directions[select_inds[:, 0], select_inds[:, 1], :]  # (cfg.nerf.train.num_random_rays, 3)
+        # 获取GT图像及(GT背景/训练背景)中选出的像素坐标的颜色 (512,512,3) ==> (cfg.nerf.train.num_random_rays, 3)
+        target_ray_values = img_target[select_inds[:, 0], select_inds[:, 1], :]
+        background_ray_values = self.dataset.background[select_inds[:, 0], select_inds[:, 1], :] if (
+                self.dataset.trainable_background or self.dataset.fixed_background) else None
+
+        # 计算渲染后的像素颜色
+        rgb_coarse, rgb_fine, weights = run_one_iter_of_nerf(
+            self.dataset.H,  # 图像高度
+            self.dataset.W,  # 图像宽度
+            self.dataset.focal,  # 相机焦距
+            self.model_coarse,  # 粗模型
+            self.model_fine,  # 细模型
+            ray_origins,  # 射线原点
+            ray_directions,  # 射线方向
+            self.cfg,  # 从配置文件中读取的配置
+            mode="train",  # train或validation
+            encode_position_fn=self.encode_position_fn,  # 位置编码函数
+            encode_direction_fn=self.encode_direction_fn,  # 方向编码函数
+            expressions=expression_target,  # GT表情系数
+            background_prior=background_ray_values,  # GT背景像素颜色
+            latent_code=latent_code  # 潜在代码
+        )
+
+        # 计算损失函数
+        coarse_loss = torch.nn.functional.mse_loss(rgb_coarse[..., :3], target_ray_values[..., :3])
+        fine_loss = torch.nn.functional.mse_loss(rgb_fine[..., :3], target_ray_values[..., :3]) if self.model_fine else 0.0
+        latent_code_loss = torch.norm(latent_code) * 0.0005
+        background_loss = torch.mean(
+            torch.nn.functional.mse_loss(
+                background_ray_values[..., :3], target_ray_values[..., :3], reduction='none'
+            ).sum(1) * weights
+        ) * 0.001
+
+        loss = coarse_loss
+        if self.model_fine:
+            loss = loss + fine_loss
+        psnr = mse2psnr(loss.item())
+        if self.dataset.trainable_background:
+            loss = loss + background_loss
+        if self.dataset.use_latent_codes:
+            loss = loss + latent_code_loss * 10
+
+        # 反向传播
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer.zero_grad()
+
+        # 学习率衰减
+        num_decay_steps = self.cfg.scheduler.lr_decay * 1000
+        lr_new = self.cfg.optimizer.lr * (self.cfg.scheduler.lr_decay_factor ** (i / num_decay_steps))
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = lr_new
+
+        # 输出训练指标
+        if i % self.cfg.experiment.print_every == 0 or i == self.cfg.experiment.train_iters - 1:
+            tqdm.write(f"[TRAIN] Iter: {str(i)} Loss: {str(loss.item())} BG Loss: {str(background_loss.item())} PSNR: {str(psnr)} LatentReg: {str(latent_code_loss.item())}")
+
+        # 生成训练日志
+        self.generate_train_log(i, coarse_loss, fine_loss, psnr, background_loss, latent_code_loss)
+
+        # 保存检查点
+        if i % self.cfg.experiment.save_every == 0 or i == self.cfg.experiment.train_iters - 1:
+            self.save_checkpoint(i, loss - background_loss, psnr)
+
+    def create_logdir(self):
+        basedir = self.cfg.experiment.logdir if self.mode is Mode.TRAIN else self.args.savedir
+        log_time = datetime.now().strftime('%Y-%m-%d %H_%M_%S')
+        logdir = os.path.join(basedir, self.cfg.experiment.id, log_time)
+        os.makedirs(logdir, exist_ok=True)
+        writer = SummaryWriter(logdir)
+        with open(os.path.join(basedir, self.cfg.experiment.id, log_time, "config.yml"), "w") as f:
+            f.write(self.cfg.dump())
+        with open(os.path.join(basedir, self.cfg.experiment.id, log_time, "args.txt"), "w") as f:
+            for key in vars(self.args):
+                f.write(f'{key}: {getattr(self.args, key)}\n')
+        return logdir, writer
+
+    def load_checkpoint(self):
+        checkpoint = torch.load(self.args.checkpoint)
+        self.model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
+        if checkpoint["model_fine_state_dict"]:
+            self.model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
+        if checkpoint["background"]:
+            self.dataset.background = torch.nn.Parameter(checkpoint['background'].to(self.device))
+        if checkpoint["latent_codes"]:
+            self.dataset.latent_codes = torch.nn.Parameter(checkpoint['latent_codes'].to(self.device))
+            if self.mode is Mode.TEST:
+                self.dataset.idx_map = np.load(self.cfg.dataset.basedir + "/index_map.npy").astype(int)
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.start_iter = checkpoint["iter"]
+
+    def generate_train_log(self, i, coarse_loss, fine_loss, psnr, background_loss, latent_code_loss):
+        self.writer.add_scalar("train/coarse_loss", coarse_loss.item(), i)
+        if self.model_fine:
+            self.writer.add_scalar("train/fine_loss", fine_loss.item(), i)
+        self.writer.add_scalar("train/psnr", psnr, i)
+        if self.dataset.trainable_background:
+            self.writer.add_scalar("train/bg_loss", background_loss.item(), i)
+        if self.dataset.use_latent_codes:
+            self.writer.add_scalar("train/code_loss", latent_code_loss.item(), i)
+
+    def save_checkpoint(self, i, loss, psnr):
+        checkpoint_dict = {
+            "iter": i,
+            "model_coarse_state_dict": self.model_coarse.state_dict(),
+            "model_fine_state_dict": self.model_fine.state_dict() if self.model_fine else None,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "loss": loss,
+            "psnr": psnr,
+            "background": self.dataset.background.data if (
+                        self.dataset.trainable_background or self.dataset.fixed_background) else None,
+            "latent_codes": self.dataset.latent_codes.data if self.dataset.use_latent_codes else None
+        }
+        torch.save(
+            checkpoint_dict,
+            os.path.join(self.dataset.logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
+        )
+        tqdm.write("================== Saved Checkpoint =================")
+
+    # ---------- validate ---------- #
+    def validate(self, i):
+        self.model_coarse.eval()
+        if self.model_fine:
+            self.model_fine.eval()
+
+        start = time.time()
+        with torch.no_grad():
+            rgb_coarse, rgb_fine = None, None
+            target_ray_values = None
+
+            loss = 0
+            for img_idx in self.dataset.i_val:
+                # 获取验证集图像及其位姿、表情、潜在代码信息
+                img_target = self.dataset.images[img_idx].to(self.device)
+                pose_target = self.dataset.poses[img_idx, :3, :4].to(self.device)
+                expression_target = self.dataset.expressions[img_idx].to(self.device)
+                latent_code = torch.zeros(32).to(self.device)
+
+                # 计算穿过验证集图像所有像素的光线束的原点和方向（世界坐标系下）
+                ray_origins, ray_directions = get_ray_bundle(self.dataset.H, self.dataset.W, self.dataset.focal, pose_target)
+                ray_origins = ray_origins.view((-1, 3))
+                ray_directions = ray_directions.view((-1, 3))
+
+                # 计算渲染后的完整图像
+                rgb_coarse, rgb_fine, weights = run_one_iter_of_nerf(
+                    self.dataset.H,
+                    self.dataset.W,
+                    self.dataset.focal,
+                    self.model_coarse,
+                    self.model_fine,
+                    ray_origins,
+                    ray_directions,
+                    self.cfg,
+                    mode="validation",
+                    encode_position_fn=self.encode_position_fn,
+                    encode_direction_fn=self.encode_direction_fn,
+                    expressions=expression_target,
+                    background_prior=self.dataset.background.view(-1, 3) if (
+                            self.dataset.trainable_background or self.dataset.fixed_background) else None,
+                    latent_code=latent_code if self.dataset.use_latent_codes else None,
+                    validation_image_shape=img_target.shape
+                )
+
+                # 计算损失函数
+                target_ray_values = img_target
+                coarse_loss = img2mse(rgb_coarse[..., :3], target_ray_values[..., :3])
+                loss = loss + coarse_loss
+                if self.model_fine:
+                    fine_loss = img2mse(rgb_fine[..., :3], target_ray_values[..., :3])
+                    loss = loss + fine_loss
+
+            # 计算验证指标，生成验证日志
+            loss /= len(self.dataset.i_val)
+            psnr = mse2psnr(loss.item())
+            self.generate_validate_log(i, loss, psnr, coarse_loss, fine_loss, rgb_coarse, rgb_fine, target_ray_values, self.dataset.background, weights)
+
+            tqdm.write(f"[VAL] Iter: {i} Loss: {str(loss.item())} PSNR: {str(psnr)} Time: {str(time.time() - start)}")
+
+    def generate_validate_log(self, i, loss, psnr, coarse_loss, fine_loss, rgb_coarse, rgb_fine, target_ray_values, background, weights):
+        self.writer.add_scalar("validation/loss", loss.item(), i)
+        self.writer.add_scalar("validation/psnr", psnr, i)
+        self.writer.add_scalar("validation/coarse_loss", coarse_loss.item(), i)
+        self.writer.add_image("validation/rgb_coarse", cast_to_image(rgb_coarse[..., :3]), i)
+        if self.model_fine:
+            self.writer.add_scalar("validation/fine_loss", fine_loss.item(), i)
+            self.writer.add_image("validation/rgb_fine", cast_to_image(rgb_fine[..., :3]), i)
+        self.writer.add_image("validation/img_target", cast_to_image(target_ray_values[..., :3]), i)
+        if self.dataset.trainable_background or self.dataset.fixed_background:
+            self.writer.add_image("validation/background", cast_to_image(background[..., :3]), i)
+            self.writer.add_image("validation/weights", (weights.detach().cpu().numpy()), i, dataformats='HW')
+
+    # ---------- test ---------- #
+    def test(self):
+        # 开启测试模式
+        self.model_coarse.eval()
+        if self.model_fine:
+            self.model_fine.eval()
+
+        # 开始测试
+        times_per_image = []
+        render_poses = self.dataset.poses[self.dataset.i_test].float().to(self.device)
+        render_expressions = self.dataset.expressions[self.dataset.i_test].float().to(self.device)
+        for i in range(len(self.dataset.i_test)):
+            start = time.time()
+
+            with torch.no_grad():
+                # 准备姿态
+                pose = render_poses[i]
+                pose = pose[:3, :4]
+                # 准备表情
+                expression = render_expressions[i]
+                # 准备潜在代码（被固定住，或许可以修改一下）
+                index_of_image_after_train_shuffle = self.dataset.idx_map[10, 1]
+                latent_code = self.dataset.latent_codes[index_of_image_after_train_shuffle].to(self.device)
+
+                # 计算光线束的原点和方向
+                ray_origins, ray_directions = get_ray_bundle(self.dataset.H, self.dataset.W, self.dataset.focal, pose)
+                ray_origins = ray_origins.view((-1, 3))
+                ray_directions = ray_directions.view((-1, 3))
+
+                # 重新渲染图像
+                rgb_coarse, disp_coarse, _, rgb_fine, disp_fine, _, weights = run_one_iter_of_nerf(
+                    self.dataset.H,
+                    self.dataset.W,
+                    self.dataset.focal,
+                    self.model_coarse,
+                    self.model_fine,
+                    ray_origins,
+                    ray_directions,
+                    self.cfg,
+                    mode="validation",
+                    encode_position_fn=self.encode_position_fn,
+                    encode_direction_fn=self.encode_direction_fn,
+                    expressions=expression,
+                    background_prior=self.dataset.background.view(-1, 3) if (self.dataset.background is not None) else None,
+                    latent_code=latent_code,
+                    validation_image_shape=(self.dataset.H, self.dataset.W)
+                )
+
+                rgb = rgb_fine if rgb_fine is not None else rgb_coarse
+
+            # 保存测试结果，生成测试日志
+            times_per_image.append(time.time() - start)
+            savefile = os.path.join(self.logdir, "images", f"{i:04d}.png")
+            imageio.imwrite(savefile, cast_to_image(rgb[..., :3]))
+            tqdm.write(f"Avg time per image: {sum(times_per_image) / (i + 1)}")

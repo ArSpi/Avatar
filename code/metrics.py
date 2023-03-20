@@ -61,7 +61,7 @@ def folder_mode(args):
         f.write(f'path to GT images: {args.gt_path}.\n')
         f.write(f'path to synthetic images: {args.syn_path}.\n')
         f.write('\n')
-        f.write('='*80)
+        f.write('=' * 80)
         f.write('\n')
         print(f'folders metrics comparison.\n')
         print(f'path to GT images: {args.gt_path}.\n')
@@ -133,6 +133,7 @@ def main():
     args = parser.parse_args()
 
     folder_mode(args) if args.mode == "folder" else image_mode(args)
+
 
 if __name__ == "__main__":
     main()
