@@ -4,7 +4,6 @@ import torch
 import yaml
 from yacs.config import CfgNode
 
-from metrics import cal_folder_metrics
 from train_utils import Trainer
 from nerf_helpers import create_parser, create_nerf, seed_everything
 from dataset_utils import load_data, NeRFDataset
