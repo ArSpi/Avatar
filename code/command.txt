@@ -1,0 +1,4 @@
+# train
+python train.py --config ../dataset/person_1/person_1_config.yml
+# test
+python eval.py --config ../dataset/person_1/person_1_config.yml --checkpoint ./logs/person_1/xxx/checkpoint30000.ckpt --savedir ./renders
