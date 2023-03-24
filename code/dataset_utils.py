@@ -41,7 +41,7 @@ def pose_spherical(theta, phi, radius):
     return c2w
 
 
-def load_data(
+def load_dataset(
         basedir,  # 数据集的基准文件夹
         half_res=False,  # 是否以一半分辨率加载图像(half resolution)
         testskip=1,  # 测试集中每testskip张图像选取1张，避免测试集中相邻图像过于相似
