@@ -8,6 +8,8 @@ import cv2
 from PIL import Image
 from tqdm import tqdm
 
+from train_utils import Mode
+
 
 def translate_by_t_along_z(t):
     tform = np.eye(4).astype(np.float32)
@@ -141,7 +143,8 @@ def load_data(
 
 
 class NeRFDataset(object):
-    def __init__(self, cfg, device, images, poses, expressions, bboxs, i_split, hwf):
+    def __init__(self, mode, cfg, device, images, poses, expressions, bboxs, i_split, hwf):
+        self.mode = mode
         self.cfg = cfg
         self.device = device
         self.images = images
@@ -153,7 +156,10 @@ class NeRFDataset(object):
         self.p, self.ray_importance_sampling_maps = None, None
 
         # 获取划分的训练集、验证集、测试集索引
-        self.i_train, self.i_val, self.i_test = i_split
+        if self.mode is Mode.TRAIN:
+            self.i_train, self.i_val, self.i_test = i_split
+        else:
+            self.i_train, self.i_val, self.i_test = None, None, i_split[0]
         # 获取相机内参
         self.H, self.W, self.focal = int(hwf[0]), int(hwf[1]), hwf[2]
         # 将图像从RGBA转为RGB，公式为targetRGB = sourceRGB * sourceA + BGcolor * (1 - sourceA)
@@ -184,6 +190,7 @@ class NeRFDataset(object):
         self.background = background
 
     def load_latent_codes(self, use_latent_codes):
+        self.use_latent_codes = use_latent_codes
         if use_latent_codes:
             print("Setting latent codes.")
             latent_codes = torch.zeros((len(self.i_train), 32), device=self.device)

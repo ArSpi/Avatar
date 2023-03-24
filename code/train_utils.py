@@ -298,15 +298,14 @@ def run_one_iter_of_nerf(
 
     # 如果是验证过程，不应返回像素集，而是返回整张图像
     if mode == "validation":
-        num_pixels = validation_image_shape[0] * validation_image_shape[1]
-        shapes = [validation_image_shape, validation_image_shape, (num_pixels,)]
+        shapes = [validation_image_shape, validation_image_shape, validation_image_shape[:-1]]
         synthesized_images = [
             image.view(shape) if image is not None else None
             for (image, shape) in zip(synthesized_images, shapes)
         ]
         return tuple(synthesized_images)
 
-    # return rgb_coarse, rgb_fine, weights[:, -1] 这里的weight是细分辨率网络训练出的权重值
+    # return rgb_coarse, rgb_fine, weights[:, -1] 这里的weight是细分辨率网络训练出的背景的权重值，用于前景与背景的分割
     return tuple(synthesized_images)
 
 
@@ -470,13 +469,14 @@ class Trainer(object):
         self.model_coarse.load_state_dict(checkpoint["model_coarse_state_dict"])
         if checkpoint["model_fine_state_dict"]:
             self.model_fine.load_state_dict(checkpoint["model_fine_state_dict"])
-        if checkpoint["background"]:
+        if checkpoint["background"] is not None:
             self.dataset.background = torch.nn.Parameter(checkpoint['background'].to(self.device))
-        if checkpoint["latent_codes"]:
+        if checkpoint["latent_codes"] is not None:
             self.dataset.latent_codes = torch.nn.Parameter(checkpoint['latent_codes'].to(self.device))
             if self.mode is Mode.TEST:
                 self.dataset.idx_map = np.load(self.cfg.dataset.basedir + "/index_map.npy").astype(int)
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.mode is Mode.TRAIN:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.start_iter = checkpoint["iter"]
 
     def generate_train_log(self, i, coarse_loss, fine_loss, psnr, background_loss, latent_code_loss):
@@ -503,7 +503,7 @@ class Trainer(object):
         }
         torch.save(
             checkpoint_dict,
-            os.path.join(self.dataset.logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
+            os.path.join(self.logdir, "checkpoint" + str(i).zfill(5) + ".ckpt"),
         )
         tqdm.write("================== Saved Checkpoint =================")
 
@@ -548,7 +548,7 @@ class Trainer(object):
                     background_prior=self.dataset.background.view(-1, 3) if (
                             self.dataset.trainable_background or self.dataset.fixed_background) else None,
                     latent_code=latent_code if self.dataset.use_latent_codes else None,
-                    validation_image_shape=img_target.shape
+                    validation_image_shape=(self.dataset.H, self.dataset.W, 3)
                 )
 
                 # 计算损失函数
@@ -590,7 +590,7 @@ class Trainer(object):
         times_per_image = []
         render_poses = self.dataset.poses[self.dataset.i_test].float().to(self.device)
         render_expressions = self.dataset.expressions[self.dataset.i_test].float().to(self.device)
-        for i in range(len(self.dataset.i_test)):
+        for i in tqdm(range(len(self.dataset.i_test))):
             start = time.time()
 
             with torch.no_grad():
@@ -609,7 +609,7 @@ class Trainer(object):
                 ray_directions = ray_directions.view((-1, 3))
 
                 # 重新渲染图像
-                rgb_coarse, disp_coarse, _, rgb_fine, disp_fine, _, weights = run_one_iter_of_nerf(
+                rgb_coarse, rgb_fine, weights = run_one_iter_of_nerf(
                     self.dataset.H,
                     self.dataset.W,
                     self.dataset.focal,
@@ -624,7 +624,7 @@ class Trainer(object):
                     expressions=expression,
                     background_prior=self.dataset.background.view(-1, 3) if (self.dataset.background is not None) else None,
                     latent_code=latent_code,
-                    validation_image_shape=(self.dataset.H, self.dataset.W)
+                    validation_image_shape=(self.dataset.H, self.dataset.W, 3)
                 )
 
                 rgb = rgb_fine if rgb_fine is not None else rgb_coarse
@@ -632,5 +632,5 @@ class Trainer(object):
             # 保存测试结果，生成测试日志
             times_per_image.append(time.time() - start)
             savefile = os.path.join(self.logdir, "images", f"{i:04d}.png")
-            imageio.imwrite(savefile, cast_to_image(rgb[..., :3]))
-            tqdm.write(f"Avg time per image: {sum(times_per_image) / (i + 1)}")
+            os.makedirs(os.path.join(self.logdir, "images"), exist_ok=True)
+            imageio.imwrite(savefile, rgb[..., :3])

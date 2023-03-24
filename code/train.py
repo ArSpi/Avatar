@@ -32,7 +32,7 @@ def main():
         half_res=cfg.dataset.half_res,
         testskip=cfg.dataset.testskip
     )
-    dataset = NeRFDataset(cfg, device, images, poses, expressions, bboxs, i_split, hwf)
+    dataset = NeRFDataset(Mode.TRAIN, cfg, device, images, poses, expressions, bboxs, i_split, hwf)
     # 设置背景
     trainable_background = False
     fixed_background = True

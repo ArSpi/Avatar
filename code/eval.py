@@ -4,7 +4,7 @@ import torch
 import yaml
 from yacs.config import CfgNode
 
-from train_utils import Trainer
+from train_utils import Trainer, Mode
 from nerf_helpers import create_parser, create_nerf, seed_everything
 from dataset_utils import load_data, NeRFDataset
 
@@ -31,14 +31,14 @@ def main():
         testskip=cfg.dataset.testskip,
         test=True
     )
-    dataset = NeRFDataset(cfg, device, images, poses, expressions, bboxs, i_split, hwf)
+    dataset = NeRFDataset(Mode.TEST, cfg, device, images, poses, expressions, bboxs, i_split, hwf)
     print("Done data loading.")
 
     # 设置NeRF模型
     model_coarse, model_fine, encode_position_fn, encode_direction_fn = create_nerf(cfg)
 
     # 设置训练器
-    trainer = Trainer(args, cfg, device, model_coarse, model_fine, encode_position_fn, encode_direction_fn, None, dataset)
+    trainer = Trainer(Mode.TEST, args, cfg, device, model_coarse, model_fine, encode_position_fn, encode_direction_fn, None, dataset)
 
     # 替换背景
     replace_background = True
