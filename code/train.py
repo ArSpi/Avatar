@@ -5,6 +5,7 @@ import yaml
 from yacs.config import CfgNode
 
 import models
+from renderer import NeRFRenderer
 from dataset_utils import load_dataset, NeRFDataset
 from nerf_helpers import seed_everything, get_embedding_function
 from train_utils import Trainer, Mode
@@ -13,7 +14,7 @@ from train_utils import Trainer, Mode
 def create_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--config", type=str, help="path to (.yml) config file.", default="../dataset/person_2/person_2_config.yml"
+        "--config", type=str, help="path to (.yml) config file.", default="../dataset/person_1/person_1_config.yml"
     )
     parser.add_argument(
         "--checkpoint", type=str, help="path to load saved checkpoint.", default=""
@@ -27,12 +28,12 @@ def create_parser():
 def load_data(cfg, device):
     # 加载数据集
     print("Starting data loading.")
-    images, poses, expressions, bboxs, i_split, hwf, render_poses = load_dataset(
+    images, poses, expressions, bboxs, i_split, H, W, intrinsics, render_poses = load_dataset(
         cfg.dataset.basedir,
         half_res=cfg.dataset.half_res,
         testskip=cfg.dataset.testskip
     )
-    dataset = NeRFDataset(Mode.TRAIN, cfg, device, images, poses, expressions, bboxs, i_split, hwf)
+    dataset = NeRFDataset(Mode.TRAIN, cfg, device, images, poses, expressions, bboxs, i_split, H, W, intrinsics)
     # 设置背景
     trainable_background = False
     fixed_background = True
@@ -47,65 +48,35 @@ def load_data(cfg, device):
     return dataset, trainable_background, fixed_background, use_latent_codes
 
 
-def create_nerf(cfg):
-    # 初始化位置嵌入函数
-    encode_position_fn = get_embedding_function(
-        num_encoding_functions=cfg.models.coarse.num_encoding_fn_xyz,  # 位置编码的采样频率的数量
-        include_input=cfg.models.coarse.include_input_xyz,  # 位置编码中是否包括输入的向量
-        log_sampling=cfg.models.coarse.log_sampling_xyz,  # 位置编码的样本点是否以对数形式采样
-    )
-
-    # 初始化方向嵌入函数
-    encode_direction_fn = get_embedding_function(
-        num_encoding_functions=cfg.models.coarse.num_encoding_fn_dir,  # 方向编码的采样频率的数量
-        include_input=cfg.models.coarse.include_input_dir,  # 方向编码中是否包括输入的向量
-        log_sampling=cfg.models.coarse.log_sampling_dir,  # 方向编码的样本点是否以对数形式采样
-    )
-
-    # 初始化粗分辨率网络
-    model_coarse = getattr(models, cfg.models.coarse.type)(
+def create_model(cfg):
+    model = models.HashGridNetwork(
         # 模型结构
-        num_layers=cfg.models.coarse.num_layers,  # 模型的层数
-        hidden_size=cfg.models.coarse.hidden_size,  # 隐藏层的大小
-        skip_connect_every=cfg.models.coarse.skip_connect_every,  # 每隔多少层跳跃连接
-        # 向量嵌入
-        num_encoding_fn_xyz=cfg.models.coarse.num_encoding_fn_xyz,  # 位置编码的采样频率的数量
-        num_encoding_fn_dir=cfg.models.coarse.num_encoding_fn_dir,  # 方向编码的采样频率的数量
-        include_input_xyz=cfg.models.coarse.include_input_xyz,  # 位置编码中是否包括输入的向量
-        include_input_dir=cfg.models.coarse.include_input_dir,  # 方向编码中是否包括输入的向量
+        num_layers=cfg.models.num_layers,  # 模型的层数
+        hidden_dim=cfg.models.hidden_dim,  # 隐藏层的大小
+        geo_feat_dim=cfg.models.geo_feat_dim,
+        num_layers_color=cfg.models.num_layers_color,
+        hidden_dim_color=cfg.models.hidden_dim_color,
+        #
+        bound=cfg.bound,
         # 潜在代码
-        latent_code_dim=cfg.models.coarse.latent_code_dim
+        expression_dim=cfg.models.expression_dim,
+        latent_code_dim=cfg.models.latent_code_dim
     )
 
-    # 初始化细分辨率网络
-    model_fine = None
-    if hasattr(cfg.models, "fine"):
-        model_fine = getattr(models, cfg.models.fine.type)(
-            num_layers=cfg.models.fine.num_layers,
-            hidden_size=cfg.models.fine.hidden_size,
-            skip_connect_every=cfg.models.fine.skip_connect_every,
-
-            num_encoding_fn_xyz=cfg.models.fine.num_encoding_fn_xyz,
-            num_encoding_fn_dir=cfg.models.fine.num_encoding_fn_dir,
-            include_input_xyz=cfg.models.fine.include_input_xyz,
-            include_input_dir=cfg.models.fine.include_input_dir,
-
-            latent_code_dim=cfg.models.fine.latent_code_dim
-        )
-
-    return model_coarse, model_fine, encode_position_fn, encode_direction_fn
+    return model
 
 
-def create_optimizer(cfg, model_coarse, model_fine, dataset, trainable_background, use_latent_codes):
-    trainable_parameters = list(model_coarse.parameters())
-    if model_fine:
-        trainable_parameters += list(model_fine.parameters())
-    if trainable_background:
-        trainable_parameters.append(dataset.background)
-    if use_latent_codes:
-        trainable_parameters.append(dataset.latent_codes)
-    optimizer = getattr(torch.optim, cfg.optimizer.type)(trainable_parameters, lr=cfg.optimizer.lr)
-    return optimizer
+def create_renderer(cfg, dataset):
+    renderer = NeRFRenderer(
+        cfg=cfg,
+        dataset=dataset,
+        bound=cfg.bound,
+        density_scale=1,
+        min_near=cfg.min_near,
+        density_thresh=cfg.density_thresh
+    )
+
+    return renderer
 
 
 def main():
@@ -130,13 +101,17 @@ def main():
 
     # 设置NeRF模型
     print("Creating NeRF model.")
-    model_coarse, model_fine, encode_position_fn, encode_direction_fn = create_nerf(cfg)
+    # model_coarse, model_fine, encode_position_fn, encode_direction_fn = create_model(cfg)
+    model = create_model(cfg)
 
     # 设置优化器
-    optimizer = create_optimizer(cfg, model_coarse, model_fine, dataset, trainable_background, use_latent_codes)
+    optimizer = torch.optim.Adam(model.get_params(dataset, cfg.optimizer.lr, trainable_background, use_latent_codes))
+
+    # 设置渲染器
+    renderer = create_renderer(cfg, dataset)
 
     # 设置训练器
-    trainer = Trainer(Mode.TRAIN, args, cfg, device, model_coarse, model_fine, encode_position_fn, encode_direction_fn, optimizer, dataset)
+    trainer = Trainer(Mode.TRAIN, args, cfg, device, model, optimizer, dataset, renderer)
 
     # 开始训练
     trainer.train()

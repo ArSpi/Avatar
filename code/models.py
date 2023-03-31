@@ -1,4 +1,129 @@
+import math
+
+import numpy as np
 import torch
+import tinycudann as tcnn
+
+from activation import trunc_exp
+
+
+class HashGridNetwork(torch.nn.Module):
+    def __init__(self,
+                 num_layers=2,
+                 hidden_dim=64,
+                 geo_feat_dim=15,
+                 num_layers_color=3,
+                 hidden_dim_color=64,
+                 bound=1,
+                 expression_dim=76,
+                 latent_code_dim=32
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_dim = hidden_dim
+        self.geo_feat_dim = geo_feat_dim
+        self.num_layers_color = num_layers_color
+        self.hidden_dim_color = hidden_dim_color
+        self.bound = bound
+        self.expression_dim = expression_dim,
+        self.latent_code_dim = latent_code_dim
+
+        per_level_scale = np.exp2(np.log2(2048 * self.bound / 16) / (16 - 1))
+
+        self.encoder = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "HashGrid",
+                "n_levels": 16,  # 分辨率的级数
+                "n_features_per_level": 2,  # 在每个分辨率哈希表条目中的特征向量的维数
+                "log2_hashmap_size": 19,  # 哈希表的大小（以2取对数的结果）
+                "base_resolution": 16,  # 最粗糙的分辨率的大小（每一维的长度）
+                "per_level_scale": per_level_scale,  # 每级分辨率网格相较于上一级分辨率网格扩大的尺度
+            }
+        )
+
+        self.sigma_net = tcnn.Network(
+            n_input_dims=32 + expression_dim + latent_code_dim,
+            n_output_dims=1 + self.geo_feat_dim,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",  # 隐藏层的激活函数
+                "output_activation": "None",  # 输出层的激活函数
+                "n_neurons": hidden_dim,  # 隐藏层的维数
+                "n_hidden_layers": num_layers - 1,  # 隐藏层的数目
+            }
+        )
+
+        self.encoder_dir = tcnn.Encoding(
+            n_input_dims=3,
+            encoding_config={
+                "otype": "SphericalHarmonics",
+                "degree": 4,  # 使用SH的最高阶数，共使用degree^2个球谐系数
+            }
+        )
+
+        self.color_net = tcnn.Network(
+            n_input_dims=self.encoder_dir.n_output_dims + self.geo_feat_dim,
+            n_output_dims=3,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": "ReLU",
+                "output_activation": "None",
+                "n_neurons": hidden_dim_color,
+                "n_hidden_layers": num_layers_color - 1,
+            }
+        )
+
+    def forward(self, x, d, exp, latent_code):
+        # ----- density ----- #
+        x = (x + self.bound) / (2 * self.bound)
+        x = self.encoder(x)
+        x = torch.cat((x, exp, latent_code), dim=-1)
+        h = self.sigma_net(x)
+
+        sigma = trunc_exp(h[..., 0])
+        geo_feat = h[..., 1:]
+
+        # ----- color ----- #
+        d = (d + 1) / 2
+        d = self.encoder_dir(d)
+
+        h = torch.cat([d, geo_feat], dim=-1)
+        h = self.color_net(h)
+
+        color = torch.sigmoid(h)
+
+        return sigma, color
+
+    def density(self, x, exp, latent_code):
+        x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
+        x = self.encoder(x)
+        x = torch.cat((x, exp, latent_code), dim=-1)
+        h = self.sigma_net(x)
+
+        sigma = trunc_exp(h[..., 0])
+        geo_feat = h[..., 1:]
+
+        return {
+            'sigma': sigma,
+            'geo_feat': geo_feat,
+        }
+
+    def get_params(self, dataset, lr, trainable_background, use_latent_codes):
+        params = [
+            {'params': self.encoder.parameters(), 'lr': lr},
+            {'params': self.sigma_net.parameters(), 'lr': lr},
+            {'params': self.encoder_dir.parameters(), 'lr': lr},
+            {'params': self.color_net.parameters(), 'lr': lr}
+        ]
+        if trainable_background:
+            params.append({'params': dataset.background, 'lr': lr})
+        if use_latent_codes:
+            params.append({'params': dataset.latent_codes, 'lr': lr})
+        return params
+
+
+
 
 
 class ConditionalBlendshapePaperNeRFModel(torch.nn.Module):

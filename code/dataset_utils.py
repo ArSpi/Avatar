@@ -8,6 +8,7 @@ import cv2
 from PIL import Image
 from tqdm import tqdm
 
+from code.nerf_helpers import meshgrid_xy
 from train_utils import Mode
 
 
@@ -101,7 +102,7 @@ def load_dataset(
     camera_angle_x = float(metas['test']['camera_angle_x'])
     focal = 0.5 * W / np.tan(0.5 * camera_angle_x)
     intrinsics = np.array(metas['test']["intrinsics"]) if metas['test']["intrinsics"] else np.array(
-        [focal, focal, 0.5, 0.5])
+        [focal, focal, 0.5 * W, 0.5 * H])
 
     # 直接生成渲染图像时应当使用的人脸姿态
     render_poses = torch.stack(
@@ -109,14 +110,14 @@ def load_dataset(
             torch.from_numpy(pose_spherical(angle, -30.0, 4.0))
             for angle in np.linspace(-180, 180, 40 + 1)[:-1]
         ],
-        0,
+        0
     )
 
     # 将numpy转化为torch
     # 转化图像：节省性能时，每张图像只加载原先的1/4
     if half_res:
         H, W = H // 2, W // 2
-        intrinsics[:2] = intrinsics[:2] * 0.5
+        intrinsics = intrinsics * 0.5
         imgs = [
             torch.from_numpy(cv2.resize(imgs[i], dsize=(H, W), interpolation=cv2.INTER_AREA))
             for i in range(imgs.shape[0])
@@ -139,11 +140,11 @@ def load_dataset(
     bboxs = torch.from_numpy(bboxs).int()
 
     # 返回最终值
-    return imgs, poses, expressions, bboxs, i_split, [H, W, intrinsics], render_poses
+    return imgs, poses, expressions, bboxs, i_split, H, W, intrinsics, render_poses
 
 
 class NeRFDataset(object):
-    def __init__(self, mode, cfg, device, images, poses, expressions, bboxs, i_split, hwf):
+    def __init__(self, mode, cfg, device, images, poses, expressions, bboxs, i_split, H, W, intrinsics):
         self.mode = mode
         self.cfg = cfg
         self.device = device
@@ -154,6 +155,7 @@ class NeRFDataset(object):
         self.trainable_background, self.fixed_background, self.background = None, None, None
         self.use_latent_codes, self.latent_codes, self.idx_map = None, None, None
         self.p, self.ray_importance_sampling_maps = None, None
+        self.num_data = self.images.shape[0]
 
         # 获取划分的训练集、验证集、测试集索引
         if self.mode is Mode.TRAIN:
@@ -161,7 +163,9 @@ class NeRFDataset(object):
         else:
             self.i_train, self.i_val, self.i_test = None, None, i_split[0]
         # 获取相机内参
-        self.H, self.W, self.focal = int(hwf[0]), int(hwf[1]), hwf[2]
+        self.H = int(H)
+        self.W = int(W)
+        self.intrinsics = intrinsics
         # 将图像从RGBA转为RGB，公式为targetRGB = sourceRGB * sourceA + BGcolor * (1 - sourceA)
         if cfg.nerf.train.white_background:  # BGcolor = 1
             self.images = self.images[..., :3] * self.images[..., -1:] + (1.0 - self.images[..., -1:])

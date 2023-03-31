@@ -5,6 +5,7 @@ import random
 import numpy as np
 import torch
 import torchvision
+from packaging import version as pver
 
 
 # 获取编码函数，对positional_encoding函数进一步封装，输入仅为变量x
@@ -59,8 +60,8 @@ def get_ray_bundle(
         torch.arange(height, dtype=tform_cam2world.dtype, device=tform_cam2world.device)
     )
     directions = torch.stack([
-        (ii - width * intrinsics[2]) / intrinsics[0],
-        -(jj - height * intrinsics[3]) / intrinsics[1],
+        (ii - intrinsics[2]) / intrinsics[0],
+        -(jj - intrinsics[3]) / intrinsics[1],
         -torch.ones_like(ii),
     ], dim=-1,
     )
@@ -78,7 +79,7 @@ def get_ray_bundle(
 def meshgrid_xy(
         tensor1: torch.Tensor, tensor2: torch.Tensor
 ):
-    ii, jj = torch.meshgrid(tensor1, tensor2)
+    ii, jj = custom_meshgrid(tensor1, tensor2)
     return ii.transpose(-1, -2), jj.transpose(-1, -2)
 
 
@@ -215,3 +216,11 @@ def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
+
+
+def custom_meshgrid(*args):
+    # ref: https://pytorch.org/docs/stable/generated/torch.meshgrid.html?highlight=meshgrid#torch.meshgrid
+    if pver.parse(torch.__version__) < pver.parse('1.10'):
+        return torch.meshgrid(*args)
+    else:
+        return torch.meshgrid(*args, indexing='ij')
