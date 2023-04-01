@@ -216,7 +216,7 @@ class NeRFDataset(object):
             # 概率归一化
             probs = (1 / probs.sum()) * probs
             # 压扁后加入射线重要性采样图中
-            ray_importance_sampling_maps.append(probs.reshape(-1))
+            ray_importance_sampling_maps.append(torch.from_numpy(probs.reshape(-1)))
         self.ray_importance_sampling_maps = ray_importance_sampling_maps
 
     # ---------- test ---------- #

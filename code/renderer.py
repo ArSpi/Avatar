@@ -11,20 +11,19 @@ import raymarching
 class NeRFRenderer(torch.nn.Module):
     def __init__(self,
                  cfg,
+                 model,
                  dataset,
-                 # bound=1,
-                 # density_scale=1,
-                 # min_near=0.2,
-                 # density_thresh=0.01
                  ):
+        super().__init__()
         self.cfg = cfg
+        self.model = model
         self.dataset = dataset
-        self.bound = self.cfg.bound
+        self.bound = self.cfg.renderer.bound
         self.cascade = 1 + math.ceil(math.log2(self.bound))
         self.grid_size = 128
-        self.density_scale = self.cfg.density_scale
-        self.min_near = self.cfg.min_near
-        self.density_thresh = self.cfg.density_thresh
+        self.density_scale = self.cfg.renderer.density_scale
+        self.min_near = self.cfg.nerf.train.min_near
+        self.density_thresh = self.cfg.renderer.density_thresh
 
         aabb_train = torch.FloatTensor([-self.bound, -self.bound, -self.bound, self.bound, self.bound, self.bound])
         aabb_infer = aabb_train.clone()
@@ -69,32 +68,31 @@ class NeRFRenderer(torch.nn.Module):
         # 射线方向归一化
         directions = directions / torch.norm(directions, dim=-1, keepdim=True)
         # 获取射线原点和射线方向（世界坐标系下）
-        rays_d = directions @ self.dataset.poses[index][:3, :3].transpose(-1, -2)
-        rays_o = self.dataset.poses[index][:3, 3].expand(rays_d.shape)
+        pose = self.dataset.poses[index].to(self.dataset.device)
+        rays_d = directions @ pose[:3, :3].transpose(-1, -2)
+        rays_o = pose[:3, 3].expand(rays_d.shape)
 
         return rays_o, rays_d, select_inds
 
     @torch.no_grad()
-    def mark_untrained_grid(self, dataset, S=64):
+    def mark_untrained_grid(self, S=64):
         # poses: [B, 4, 4]
         # intrinsics: [4]
 
-        poses = dataset.poses
-        intrinsics = dataset.intrinsics
+        poses = self.dataset.poses.to(self.dataset.device)
+        intrinsics = self.dataset.intrinsics
 
-        B = dataset.num_data
+        B = self.dataset.num_data
 
         fx, fy, cx, cy = intrinsics
 
         # 创建tensor([0,...,grid_size-1])，然后按照S=64切割
-        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+        X = torch.arange(self.grid_size, dtype=torch.int32, device=self.dataset.device).split(S)
+        Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.dataset.device).split(S)
+        Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.dataset.device).split(S)
 
         mask_aabb = torch.zeros_like(self.density_grid)  # 用来标记超出aabb框范围的网格
         mask_cam = torch.zeros_like(self.density_grid)  # 用来标记超出摄像机范围的网格
-
-        poses = poses.to(dataset.device)
 
         for xs in X:  # [0,...,S-1],...,[kS,...,last]
             for ys in Y:  # [0,...,S-1],...,[kS,...,last]
@@ -161,9 +159,9 @@ class NeRFRenderer(torch.nn.Module):
 
         # 全部更新体素网格密度
         if self.num_update_density < 16:
-            X = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-            Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
-            Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.density_bitfield.device).split(S)
+            X = torch.arange(self.grid_size, dtype=torch.int32, device=self.dataset.device).split(S)
+            Y = torch.arange(self.grid_size, dtype=torch.int32, device=self.dataset.device).split(S)
+            Z = torch.arange(self.grid_size, dtype=torch.int32, device=self.dataset.device).split(S)
 
             for xs in X:
                 for ys in Y:
@@ -187,7 +185,7 @@ class NeRFRenderer(torch.nn.Module):
                             # 为坐标添加[-hgs, hgs]内的扰动
                             cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
                             # 查询添加扰动后的坐标对应的密度值
-                            sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                            sigmas = self.model.density(cas_xyzs)['sigma'].reshape(-1).detach()
                             # 放大体素网格顶点的密度，使密度更加尖锐，可以提升性能
                             sigmas *= self.density_scale
                             # 存储密度
@@ -198,15 +196,13 @@ class NeRFRenderer(torch.nn.Module):
             N = self.grid_size ** 3 // 4  # H * H * H / 4
             for cas in range(self.cascade):
                 # 随机选择N个体素网格顶点的三维坐标
-                coords = torch.randint(0, self.grid_size, (N, 3),
-                                       device=self.density_bitfield.device)  # [N, 3], in [0, 128)
+                coords = torch.randint(0, self.grid_size, (N, 3), device=self.dataset.device)  # [N, 3], in [0, 128)
                 # 获取这些坐标的莫顿编码
                 indices = raymarching.morton3D(coords).long()  # [N]
                 # 获取非零密度的索引，density_grid[cas]是当前分辨率下各网格顶点的密度
                 occ_indices = torch.nonzero(self.density_grid[cas] > 0).squeeze(-1)  # [Nz]
                 # 在非零密度的网格顶点中随机选择N个顶点
-                rand_mask = torch.randint(0, occ_indices.shape[0], [N], dtype=torch.long,
-                                          device=self.density_bitfield.device)
+                rand_mask = torch.randint(0, occ_indices.shape[0], [N], dtype=torch.long, device=self.dataset.device)
                 # 使用rand_mask随机选择N个非零密度的网格顶点
                 occ_indices = occ_indices[rand_mask]  # [Nz] --> [N], allow for duplication
                 # 从这些顶点的莫顿编码中获取顶点的三维坐标
@@ -227,7 +223,7 @@ class NeRFRenderer(torch.nn.Module):
                 # 为坐标添加[-hgs, hgs]内的扰动
                 cas_xyzs += (torch.rand_like(cas_xyzs) * 2 - 1) * half_grid_size
                 # 查询添加扰动后的坐标对应的密度值
-                sigmas = self.density(cas_xyzs)['sigma'].reshape(-1).detach()
+                sigmas = self.model.density(cas_xyzs)['sigma'].reshape(-1).detach()
                 # 放大体素网格顶点的密度，使密度更加尖锐，可以提升性能
                 sigmas *= self.density_scale
                 # 存储密度
@@ -282,11 +278,11 @@ class NeRFRenderer(torch.nn.Module):
                 fars,  # 远边界
                 sample_ray_counter,  # 计数采样点的数量和射线的数量
                 self.mean_sample_count,  #
-                self.cfg.perturb,  #
-                128,  #
-                self.cfg.force_all_rays,  # False
-                self.cfg.dt_gamma,  #
-                self.cfg.max_steps  #
+                self.cfg.nerf.train.perturb,  #
+                128,
+                False,
+                self.cfg.nerf.train.dt_gamma,  #
+                self.cfg.nerf.train.max_samples_per_ray  #
             )
 
             # --------------------* 运行模型 *--------------------- #
@@ -298,7 +294,7 @@ class NeRFRenderer(torch.nn.Module):
                 rgbs,
                 deltas,
                 rays,
-                self.cfg.T_thresh
+                self.cfg.nerf.train.T_thresh
             )
 
             rgb_pred = rgb_pred + (1 - weights_sum).unsqueeze(-1) * background_prior

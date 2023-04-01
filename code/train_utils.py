@@ -11,7 +11,7 @@ from tqdm import trange, tqdm
 from torch_ema import ExponentialMovingAverage
 from rich.console import Console
 
-from nerf_helpers import  get_ray_bundle, mse2psnr, cast_to_image, img2mse
+from nerf_helpers import mse2psnr, cast_to_image, img2mse
 
 
 class Mode(Enum):
@@ -24,7 +24,6 @@ class Trainer(object):
                  mode,
                  args,
                  cfg,
-                 device,
                  model,
                  optimizer,
                  dataset,
@@ -33,14 +32,14 @@ class Trainer(object):
         self.mode = mode
         self.args = args
         self.cfg = cfg
-        self.device = device
         self.model = model
         self.optimizer = optimizer
         self.dataset = dataset
         self.renderer = renderer
 
         # 将模型加载到GPU
-        model.to(self.device)
+        model.to(self.dataset.device)
+        renderer.to(self.dataset.device)
         # 创建日志文件夹
         self.logdir, self.writer, self.log_file = self.create_logdir()
         self.console = Console()
@@ -48,13 +47,12 @@ class Trainer(object):
         if os.path.exists(self.args.checkpoint):
             self.load_checkpoint()
         # 设置EMA
-        self.ema = ExponentialMovingAverage(self.model.parameters(), decay=self.cfg.ema_decay)
+        self.ema = ExponentialMovingAverage(self.model.parameters(), decay=self.cfg.trainer.ema_decay)
         # 设置AMP放大梯度的scaler
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg.fp16)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.cfg.trainer.fp16)
 
         # 设置训练参数
         self.start_iter = 0
-
 
     # ---------- utils ---------- #
     def create_logdir(self):
@@ -101,9 +99,9 @@ class Trainer(object):
         self.scaler.load_state_dict(checkpoint["scaler"])
         self.ema.load_state_dict(checkpoint["ema"])
         if checkpoint["background"] is not None:
-            self.dataset.background = torch.nn.Parameter(checkpoint['background'].to(self.device))
+            self.dataset.background = torch.nn.Parameter(checkpoint['background'].to(self.dataset.device))
         if checkpoint["latent_codes"] is not None:
-            self.dataset.latent_codes = torch.nn.Parameter(checkpoint['latent_codes'].to(self.device))
+            self.dataset.latent_codes = torch.nn.Parameter(checkpoint['latent_codes'].to(self.dataset.device))
             if self.mode is Mode.TEST:
                 self.dataset.idx_map = np.load(self.cfg.dataset.basedir + "/index_map.npy").astype(int)
 
@@ -139,12 +137,13 @@ class Trainer(object):
     # ---------- train ---------- #
     def train(self):
         print("Marking untrained grid.")
-        self.renderer.mark_untrained_grid(self.dataset)
+        self.renderer.mark_untrained_grid()
 
         print("Starting loop.")
         for i in trange(self.start_iter + 1, self.cfg.experiment.train_iters + 1):
             # 开启训练模式
             self.model.train()
+            self.renderer.train()
             # 训练阶段
             self.train_one_step(i)
             # 验证阶段
@@ -153,26 +152,26 @@ class Trainer(object):
         print("Done!")
 
     def train_one_step(self, i):
-        if i % self.cfg.update_extra_interval == 0:
-            with torch.cuda.amp.autocast(enabled=self.cfg.fp16):
+        if i % self.cfg.renderer.update_extra_interval == 0:
+            with torch.cuda.amp.autocast(enabled=self.cfg.trainer.fp16):
                 self.renderer.update_extra_state(i)
 
         # 从训练集中选出一张图像及其表情、潜在代码、重要性采样图信息
         index = np.random.choice(self.dataset.i_train)
         image = self.dataset.images[index].to(self.dataset.device)
-        expression = self.dataset.expressions[index].to(self.device)
-        latent_code = self.dataset.latent_codes[index].to(self.device) if self.dataset.use_latent_codes else None
-        ray_importance_sampling_map = self.dataset.ray_importance_sampling_maps[index]
+        expression = self.dataset.expressions[index].to(self.dataset.device)
+        latent_code = self.dataset.latent_codes[index] if self.dataset.use_latent_codes else None
+        ray_importance_sampling_map = self.dataset.ray_importance_sampling_maps[index].to(self.dataset.device)
 
         # 计算射线束的原点(N,3)和方向(N,3)（世界坐标系下）
-        rays_o, rays_d, select_inds = self.renderer.get_rays(index, self.cfg.num_sample_rays, ray_importance_sampling_map)
+        rays_o, rays_d, select_inds = self.renderer.get_rays(index, self.cfg.nerf.train.num_sample_rays, ray_importance_sampling_map)
 
-        rgb_gt = torch.gather(image.view(-1, 3), dim=1, index=torch.stack([select_inds, select_inds, select_inds], -1))
-        background_gt = torch.gather(self.dataset.background.view(-1, 3), dim=1, index=torch.stack([select_inds, select_inds, select_inds], -1)) if (
+        rgb_gt = torch.gather(image.view(-1, 3), dim=-2, index=torch.stack([select_inds, select_inds, select_inds], -1))
+        background_gt = torch.gather(self.dataset.background.view(-1, 3), dim=-2, index=torch.stack([select_inds, select_inds, select_inds], -1)) if (
                 self.dataset.trainable_background or self.dataset.fixed_background) else None
 
         # 计算渲染后的像素颜色
-        with torch.cuda.amp.autocast(enabled=self.cfg.fp16):
+        with torch.cuda.amp.autocast(enabled=self.cfg.trainer.fp16):
             rgb_pred = self.renderer.render(
                 self.model,
                 self.mode,
@@ -207,7 +206,7 @@ class Trainer(object):
             param_group["lr"] = lr_new
 
         # 输出训练指标
-        if i % self.cfg.experiment.print_every == 0 or i == self.cfg.experiment.train_iters - 1:
+        if i % self.cfg.experiment.print_every == 0 or i == self.cfg.experiment.train_iters:
             tqdm.write(
                 f"[TRAIN] Iter: {str(i)} Loss: {str(loss.item())} PSNR: {str(psnr)} LatentReg: {str(latent_code_loss.item())}")
 
@@ -215,7 +214,7 @@ class Trainer(object):
         self.generate_train_log(i, loss, psnr, latent_code_loss)
 
         # 保存检查点
-        if i % self.cfg.experiment.save_every == 0 or i == self.cfg.experiment.train_iters - 1:
+        if i % self.cfg.experiment.save_every == 0 or i == self.cfg.experiment.train_iters:
             self.save_checkpoint(i, loss, psnr)
 
     # ---------- validate ---------- #
@@ -232,10 +231,10 @@ class Trainer(object):
             loss = 0
             for img_idx in self.dataset.i_val:
                 # 获取验证集图像及其位姿、表情、潜在代码信息
-                img_target = self.dataset.images[img_idx].to(self.device)
-                pose_target = self.dataset.poses[img_idx, :3, :4].to(self.device)
-                expression_target = self.dataset.expressions[img_idx].to(self.device)
-                latent_code = torch.zeros(32).to(self.device)
+                img_target = self.dataset.images[img_idx].to(self.dataset.device)
+                pose_target = self.dataset.poses[img_idx, :3, :4].to(self.dataset.device)
+                expression_target = self.dataset.expressions[img_idx].to(self.dataset.device)
+                latent_code = torch.zeros(32).to(self.dataset.device)
 
                 # 计算穿过验证集图像所有像素的光线束的原点和方向（世界坐标系下）
                 ray_origins, ray_directions = get_ray_bundle(self.dataset.H, self.dataset.W, self.dataset.intrinsics,
@@ -302,8 +301,8 @@ class Trainer(object):
 
         # 开始测试
         times_per_image = []
-        render_poses = self.dataset.poses[self.dataset.i_test].float().to(self.device)
-        render_expressions = self.dataset.expressions[self.dataset.i_test].float().to(self.device)
+        render_poses = self.dataset.poses[self.dataset.i_test].float().to(self.dataset.device)
+        render_expressions = self.dataset.expressions[self.dataset.i_test].float().to(self.dataset.device)
         for i in tqdm(range(len(self.dataset.i_test))):
             start = time.time()
 
@@ -315,7 +314,7 @@ class Trainer(object):
                 expression = render_expressions[i]
                 # 准备潜在代码（被固定住，或许可以修改一下）
                 index_of_image_after_train_shuffle = self.dataset.idx_map[10, 1]
-                latent_code = self.dataset.latent_codes[index_of_image_after_train_shuffle].to(self.device)
+                latent_code = self.dataset.latent_codes[index_of_image_after_train_shuffle].to(self.dataset.device)
 
                 # 计算光线束的原点和方向
                 ray_origins, ray_directions = get_ray_bundle(self.dataset.H, self.dataset.W, self.dataset.intrinsics,

@@ -8,25 +8,17 @@ from activation import trunc_exp
 
 
 class HashGridNetwork(torch.nn.Module):
-    def __init__(self,
-                 num_layers=2,
-                 hidden_dim=64,
-                 geo_feat_dim=15,
-                 num_layers_color=3,
-                 hidden_dim_color=64,
-                 bound=1,
-                 expression_dim=76,
-                 latent_code_dim=32
-    ):
+    def __init__(self, cfg):
         super().__init__()
-        self.num_layers = num_layers
-        self.hidden_dim = hidden_dim
-        self.geo_feat_dim = geo_feat_dim
-        self.num_layers_color = num_layers_color
-        self.hidden_dim_color = hidden_dim_color
-        self.bound = bound
-        self.expression_dim = expression_dim,
-        self.latent_code_dim = latent_code_dim
+        self.cfg = cfg
+        self.num_layers = self.cfg.models.num_layers
+        self.hidden_dim = self.cfg.models.hidden_dim
+        self.geo_feat_dim = self.cfg.models.geo_feat_dim
+        self.num_layers_color = self.cfg.models.num_layers_color
+        self.hidden_dim_color = self.cfg.models.hidden_dim_color
+        self.bound = self.cfg.renderer.bound
+        self.expression_dim = self.cfg.models.expression_dim
+        self.latent_code_dim = self.cfg.models.latent_code_dim
 
         per_level_scale = np.exp2(np.log2(2048 * self.bound / 16) / (16 - 1))
 
@@ -43,14 +35,14 @@ class HashGridNetwork(torch.nn.Module):
         )
 
         self.sigma_net = tcnn.Network(
-            n_input_dims=32 + expression_dim + latent_code_dim,
+            n_input_dims=32 + self.expression_dim + self.latent_code_dim,
             n_output_dims=1 + self.geo_feat_dim,
             network_config={
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",  # 隐藏层的激活函数
                 "output_activation": "None",  # 输出层的激活函数
-                "n_neurons": hidden_dim,  # 隐藏层的维数
-                "n_hidden_layers": num_layers - 1,  # 隐藏层的数目
+                "n_neurons": self.hidden_dim,  # 隐藏层的维数
+                "n_hidden_layers": self.num_layers,  # 隐藏层的数目
             }
         )
 
@@ -69,8 +61,8 @@ class HashGridNetwork(torch.nn.Module):
                 "otype": "FullyFusedMLP",
                 "activation": "ReLU",
                 "output_activation": "None",
-                "n_neurons": hidden_dim_color,
-                "n_hidden_layers": num_layers_color - 1,
+                "n_neurons": self.hidden_dim_color,
+                "n_hidden_layers": self.num_layers_color,
             }
         )
 
@@ -78,7 +70,12 @@ class HashGridNetwork(torch.nn.Module):
         # ----- density ----- #
         x = (x + self.bound) / (2 * self.bound)
         x = self.encoder(x)
-        x = torch.cat((x, exp, latent_code), dim=-1)
+
+        batch = x.shape[0]
+        batch_exp = torch.broadcast_to(exp, (batch,) + exp.shape)
+        batch_latent_code = torch.broadcast_to(latent_code, (batch,) + latent_code.shape)
+
+        x = torch.cat((x, batch_exp, batch_latent_code), dim=-1)
         h = self.sigma_net(x)
 
         sigma = trunc_exp(h[..., 0])
@@ -98,7 +95,12 @@ class HashGridNetwork(torch.nn.Module):
     def density(self, x, exp, latent_code):
         x = (x + self.bound) / (2 * self.bound)  # to [0, 1]
         x = self.encoder(x)
-        x = torch.cat((x, exp, latent_code), dim=-1)
+
+        batch = x.shape[0]
+        batch_exp = torch.broadcast_to(exp, (batch,) + exp.shape)
+        batch_latent_code = torch.broadcast_to(latent_code, (batch,) + latent_code.shape)
+
+        x = torch.cat((x, batch_exp, batch_latent_code), dim=-1)
         h = self.sigma_net(x)
 
         sigma = trunc_exp(h[..., 0])

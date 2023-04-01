@@ -7,7 +7,7 @@ from yacs.config import CfgNode
 import models
 from renderer import NeRFRenderer
 from dataset_utils import load_dataset, NeRFDataset
-from nerf_helpers import seed_everything, get_embedding_function
+from nerf_helpers import seed_everything
 from train_utils import Trainer, Mode
 
 
@@ -48,37 +48,6 @@ def load_data(cfg, device):
     return dataset, trainable_background, fixed_background, use_latent_codes
 
 
-def create_model(cfg):
-    model = models.HashGridNetwork(
-        # 模型结构
-        num_layers=cfg.models.num_layers,  # 模型的层数
-        hidden_dim=cfg.models.hidden_dim,  # 隐藏层的大小
-        geo_feat_dim=cfg.models.geo_feat_dim,
-        num_layers_color=cfg.models.num_layers_color,
-        hidden_dim_color=cfg.models.hidden_dim_color,
-        #
-        bound=cfg.bound,
-        # 潜在代码
-        expression_dim=cfg.models.expression_dim,
-        latent_code_dim=cfg.models.latent_code_dim
-    )
-
-    return model
-
-
-def create_renderer(cfg, dataset):
-    renderer = NeRFRenderer(
-        cfg=cfg,
-        dataset=dataset,
-        bound=cfg.bound,
-        density_scale=1,
-        min_near=cfg.min_near,
-        density_thresh=cfg.density_thresh
-    )
-
-    return renderer
-
-
 def main():
     # 设置调试时返回更多信息
     torch.autograd.set_detect_anomaly(True)
@@ -101,17 +70,16 @@ def main():
 
     # 设置NeRF模型
     print("Creating NeRF model.")
-    # model_coarse, model_fine, encode_position_fn, encode_direction_fn = create_model(cfg)
-    model = create_model(cfg)
+    model = models.HashGridNetwork(cfg)
 
     # 设置优化器
     optimizer = torch.optim.Adam(model.get_params(dataset, cfg.optimizer.lr, trainable_background, use_latent_codes))
 
     # 设置渲染器
-    renderer = create_renderer(cfg, dataset)
+    renderer = NeRFRenderer(cfg, model, dataset)
 
     # 设置训练器
-    trainer = Trainer(Mode.TRAIN, args, cfg, device, model, optimizer, dataset, renderer)
+    trainer = Trainer(Mode.TRAIN, args, cfg, model, optimizer, dataset, renderer)
 
     # 开始训练
     trainer.train()
